@@ -56,6 +56,25 @@ python -m http.server 8080
 
 > GitHub 单文件上限 100 MB，本仓库最大文件是 9.7 MB 的 `model.bin`，没有压力。
 
+### 一键上传（改完文件后）
+
+双击项目根目录的 **`上传到GitHub.bat`**（或桌面上的「上传到GitHub」快捷方式）即可。
+脚本会自动完成「扫描改动 → 提交 → 推送」，推送后 GitHub Pages 约 1 分钟重新部署。
+没有改动时它只会提示一句，不会产生空提交。
+
+命令行等价写法：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\push.ps1
+powershell -ExecutionPolicy Bypass -File tools\push.ps1 -Message "自定义提交说明"
+```
+
+**首次使用要授权一次**：Git Credential Manager 会弹出「Connect to GitHub」窗口，
+选 `Sign in with your browser`，在浏览器里点 Authorize。之后凭据存在 Windows 凭据管理器里，不再询问。
+
+> ⚠️ 国内网络直连 `github.com` 经常不通（表现为 push 卡住或 `Failed to connect ... :443`）。
+> 遇到就先开加速器（如 Watt Toolkit）再重试。
+
 ---
 
 ## 3. 换模型 / 加模型

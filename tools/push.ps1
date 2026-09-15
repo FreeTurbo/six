@@ -47,7 +47,7 @@ function Finish {
     exit $code
 }
 
-Clear-Host
+try { Clear-Host } catch { }
 Write-Host ''
 Write-Host '  上传网站到 GitHub' -ForegroundColor White
 Write-Host "  $project" -ForegroundColor DarkGray
