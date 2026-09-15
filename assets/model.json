@@ -1,0 +1,42 @@
+{
+  "_readme": "本文件由 tools/build.mjs 生成；名称/朝向/默认视角可直接手工微调，不必重新打包。",
+  "models": [
+    {
+      "id": "model-1",
+      "name": "楼梯间 · 17:43",
+      "file": "assets/model.bin",
+      "count": 227933,
+      "shDegree": 2,
+      "flipX": true,
+      "yaw": 0.1767,
+      "pitch": 1.6268,
+      "frame": {
+        "center": [
+          -0.819,
+          -1.038,
+          21.929
+        ],
+        "size": [
+          10.795,
+          19.531,
+          35.563
+        ]
+      },
+      "rawBounds": {
+        "min": [
+          -6.216,
+          -10.803,
+          4.148
+        ],
+        "max": [
+          4.579,
+          8.728,
+          39.711
+        ]
+      },
+      "source": "VID_20260914_174313.ply",
+      "generatedAt": "2026-09-15 03:00:47",
+      "generator": "tools/build.mjs (SH2, 47 B/point, deflate)"
+    }
+  ]
+}

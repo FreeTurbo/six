@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="基于 three.js 与 Spark 的高斯泼溅（3D Gaussian Splatting）模型在线展示">
+  <meta name="theme-color" content="#06080c">
+  <title>高斯泼溅模型展示</title>
+
+  <!-- 内联 SVG 图标：省一次请求，也避免 404 -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%234ade80' opacity='.22'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%234ade80'/%3E%3C/svg%3E">
+
+  <!--
+    裸说明符 → assets 下的本地文件。
+    ⚠ 用相对路径而不是 CDN：这样内网 / 离线（配合本地服务器）也能跑。
+    ⚠ 修改文件名时记得同步这里和 assets/ 目录。
+  -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./assets/three.module.js",
+      "three/addons/postprocessing/Pass.js": "./assets/Pass.js",
+      "@sparkjsdev/spark": "./assets/spark.module.js"
+    }
+  }
+  </script>
+
+  <link rel="stylesheet" href="./style.css">
+</head>
+
+<body>
+  <!-- 3D 画布挂载点 -->
+  <div id="stage"></div>
+  <!-- 画布上方的氛围层：极淡冷色辉光 + 四周压暗，给玻璃面板提供“可透视的背景” -->
+  <div id="glow"></div>
+  <div id="vignette"></div>
+
+  <!-- 标题：模型名与点数由 app.js 填充 -->
+  <header id="hud" class="glass">
+    <h1>高斯泼溅模型<span class="dot"></span></h1>
+    <p class="sub"><span class="tag">3D Gaussian Splatting · </span><span id="count">加载中…</span></p>
+  </header>
+
+  <!-- 模型切换列表：只在模型数 > 1 时显示（见 app.js 的 [2.10]） -->
+  <aside id="models" class="glass" hidden>
+    <div class="mtitle">模型列表</div>
+    <div id="mlist"></div>
+  </aside>
+
+  <!-- 工具栏 -->
+  <nav id="toolbar" class="glass">
+    <button id="btn-reset" type="button" title="回到初始视角（快捷键 R）">重置视角</button>
+    <button id="btn-auto" type="button" aria-pressed="false" title="自动旋转（快捷键 空格）">自动旋转</button>
+    <button id="btn-clean" type="button" aria-pressed="false" title="滤除把画面糊成白雾的超大低透明度高斯">去雾</button>
+    <button id="btn-full" type="button" title="全屏（快捷键 F）">全屏</button>
+  </nav>
+
+  <!-- 操作提示：文案由 app.js 按触屏/鼠标自动切换 -->
+  <div id="hint">左键拖拽旋转 · 滚轮缩放 · 中键或 Shift+左键平移 · 空格自动旋转</div>
+
+  <!-- 加载遮罩 -->
+  <div id="loading">
+    <div class="loadcard glass">
+      <div class="ring"></div>
+      <div class="ltitle">正在加载模型</div>
+      <div class="track"><div id="bar"></div></div>
+      <div id="status">准备中…</div>
+    </div>
+  </div>
+
+  <!-- 错误面板（默认隐藏） -->
+  <div id="error">
+    <div class="errbox glass">
+      <h2 id="errorTitle">出错了</h2>
+      <p id="errorDetail"></p>
+      <p id="errorHint"></p>
+    </div>
+  </div>
+
+  <!--
+    ⚠ 这段必须是「非模块」的内联脚本，不要挪进 app.js：
+      在 file:// 协议下浏览器会以 CORS 为由拒绝加载 ES 模块，app.js 根本不会执行，
+      所以「双击打开」时的兜底提示只能在这里给出。
+    提示文案统一由 __showProtocolHelp 提供，app.js 里也会调用它（用于 Firefox 等
+    允许 file:// 加载模块、但 fetch 仍被拦截的情况）。
+  -->
+  <script>
+    (function () {
+      window.__showProtocolHelp = function () {
+        var show = function () {
+          document.getElementById('errorTitle').textContent = '请通过本地服务器或线上地址打开';
+          document.getElementById('errorDetail').innerHTML =
+            '检测到当前是 <code>file://</code> 协议。浏览器出于安全策略会拦截模块脚本与数据文件读取，页面无法工作。';
+          document.getElementById('errorHint').innerHTML =
+            '本地预览：在本目录执行 <code>node tools/serve.mjs</code>（或 <code>python -m http.server 8080</code>），' +
+            '然后访问 <code>http://localhost:8080</code>。<br>部署到 GitHub Pages 后直接访问网址即可。';
+          document.getElementById('error').classList.add('show');
+          document.getElementById('loading').classList.add('hide');
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show);
+        else show();
+      };
+      if (location.protocol === 'file:') window.__showProtocolHelp();
+    })();
+  </script>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
