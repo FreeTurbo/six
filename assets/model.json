@@ -4,9 +4,13 @@
     {
       "id": "model-1",
       "name": "楼梯间 · 17:43",
-      "file": "assets/model.bin",
+      "file": "assets/model-1.bin",
       "count": 227933,
       "shDegree": 2,
+      "fileLite": "assets/model-1.lite.bin",
+      "liteCount": 79777,
+      "liteBytes": 1322530,
+      "bytes": 10191618,
       "flipX": true,
       "yaw": 0.1767,
       "pitch": 1.6268,
@@ -35,8 +39,8 @@
         ]
       },
       "source": "VID_20260914_174313.ply",
-      "generatedAt": "2026-09-15 03:00:47",
-      "generator": "tools/build.mjs (SH2, 47 B/point, deflate)"
+      "generatedAt": "2026-09-15 05:51:10",
+      "generator": "tools/build.mjs (full SH2/47B, lite 17B×35%, deflate)"
     }
   ]
 }

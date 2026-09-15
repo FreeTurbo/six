@@ -36,7 +36,7 @@ const CONFIG_URL = './assets/model.json';
 const HAZE_LOG_SCALE = -1.6;
 
 /** 首帧色彩自检：高饱和像素占比超过该值就认为渲染异常，自动切到兼容模式。 */
-const SATURATION_ALERT = 0.30;
+const SATURATION_ALERT = 0.22;
 /** 兼容模式偏好的持久化键（用户手动切换过就记住） */
 const COMPAT_KEY = 'splat-viewer.compat';
 
@@ -182,6 +182,49 @@ function unpackPly(buf) {
   return out;
 }
 
+/* ------------------------------------------------- 解码（可放 Worker） */
+/* unpackPly 是纯函数、不引用外部变量，所以可以直接把源码塞进 Worker 里跑，
+   避免 20~30 万点的解码卡住主线程的动画与交互（手机上尤其明显）。
+   Worker 创建失败时自动退回主线程。 */
+let decodeWorker = null, decodeSeq = 0;
+function getDecodeWorker() {
+  if (decodeWorker !== null) return decodeWorker;
+  try {
+    const src = 'const unpackPly=' + unpackPly.toString() + ';\n' +
+      'self.onmessage=function(e){var d=e.data;try{' +
+      'var out=unpackPly(new Uint8Array(d.buf));' +
+      'self.postMessage({id:d.id,ok:true,buf:out.buffer},[out.buffer]);' +
+      '}catch(err){self.postMessage({id:d.id,ok:false,msg:String((err&&err.message)||err)});}};';
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    decodeWorker = new Worker(url);
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.warn('[viewer] 无法创建解码 Worker，退回主线程：', e);
+    decodeWorker = false;
+  }
+  return decodeWorker;
+}
+function decodePayload(payload) {
+  const w = getDecodeWorker();
+  if (!w) return Promise.resolve(unpackPly(payload));
+  return new Promise((resolve, reject) => {
+    const id = ++decodeSeq;
+    const onMsg = (ev) => {
+      if (!ev.data || ev.data.id !== id) return;
+      w.removeEventListener('message', onMsg);
+      if (ev.data.ok) resolve(new Uint8Array(ev.data.buf));
+      else reject(new Error(ev.data.msg));
+    };
+    w.addEventListener('message', onMsg);
+    /* 独占整块 ArrayBuffer 时直接转移（零拷贝），否则先切一份再转移 */
+    let transfer = payload.buffer;
+    if (payload.byteOffset !== 0 || payload.byteLength !== payload.buffer.byteLength) {
+      transfer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+    }
+    w.postMessage({ id, buf: transfer }, [transfer]);
+  });
+}
+
 /* ------------------------------------------------------- PLY 表头解析 */
 const TYPE_SIZE = { float: 4, float32: 4, double: 8, uchar: 1, uint8: 1, char: 1, int8: 1, int: 4, int32: 4, uint: 4, uint32: 4, short: 2, int16: 2, ushort: 2, uint16: 2 };
 
@@ -296,7 +339,15 @@ async function main() {
     return;
   }
   app.models = (cfg.models || []).filter((m) => m && m.file);
-  app.state = app.models.map(() => ({ mesh: null, bytes: null, bytesNoSh: null, clean: null, cleanCount: 0 }));
+  /* 每个模型两档：lite（预览，体积约 1/8）/ full（完整）。未切换到的模型两档都是空的。 */
+  app.state = app.models.map(() => ({
+    lite: { mesh: null, bytes: null },
+    full: { mesh: null, bytes: null },
+    active: null,          // 当前显示的档位 'lite' | 'full'
+    upgrading: false,      // 是否正在后台升级到完整档
+    noSh: {},              // 兼容模式副本缓存 { full: Uint8Array }
+    clean: null, cleanCount: 0, cleanFrom: null   // 去雾副本及其来源档位
+  }));
   if (!app.models.length) {
     fatalError('模型清单是空的', '<code>assets/model.json</code> 里没有任何模型条目。',
       '用 <code>node tools/build.mjs 你的模型.ply</code> 生成一个。');
@@ -407,115 +458,245 @@ async function main() {
   function applyVisibility() {
     for (let i = 0; i < app.state.length; i++) {
       const st = app.state[i];
-      const showClean = (i === app.current) && app.cleanMode && !!st.clean;
-      if (st.mesh) st.mesh.visible = (i === app.current) && !showClean;
-      if (st.clean) st.clean.visible = showClean;
+      const isCur = i === app.current;
+      const cleanOn = isCur && app.cleanMode && !!st.clean && st.cleanFrom === st.active;
+      for (const tier of ['lite', 'full']) {
+        if (st[tier].mesh) st[tier].mesh.visible = isCur && st.active === tier && !cleanOn;
+      }
+      if (st.clean) st.clean.visible = cleanOn;
     }
   }
 
+  /** HUD 文案：点数 + 当前档位/去雾/兼容状态 */
   function updateHud() {
     if (app.current < 0) return;
     const m = app.models[app.current];
     const st = app.state[app.current];
-    const n = (app.cleanMode && st.clean) ? st.cleanCount : m.count;
-    $('count').textContent = n.toLocaleString('en-US') + ' 个高斯点' +
-      ((app.cleanMode && st.clean) ? ' · 已去雾' : '') + (app.compat ? ' · 兼容模式' : '');
+    const lite = st.active === 'lite';
+    const n = (app.cleanMode && st.clean) ? st.cleanCount : (lite ? (m.liteCount || m.count) : m.count);
+    const tags = [];
+    if (app.cleanMode && st.clean) tags.push('已去雾');
+    if (app.compat && !lite) tags.push('兼容模式');
+    if (lite) tags.push(st.upgrading ? '预览 · 正在加载高清' : '预览');
+    $('count').textContent = n.toLocaleString('en-US') + ' 个高斯点' + (tags.length ? ' · ' + tags.join(' · ') : '');
     const rows = $('mlist').children;
     for (let i = 0; i < rows.length; i++) rows[i].classList.toggle('on', i === app.current);
   }
 
-  /** 用指定字节流为第 i 个模型构建（或重建）SplatMesh */
-  async function buildMesh(i, bytes) {
+  /** 列表行右侧的小字：点数 / 下载进度 */
+  function setRowMeta(i, text) {
+    const row = $('mlist').children[i];
+    if (!row) return;
+    const el = row.querySelector('.mmeta');
+    if (el) el.textContent = text;
+  }
+  function defaultRowMeta(i) {
+    const m = app.models[i];
+    setRowMeta(i, m.count.toLocaleString('en-US') + ' 点');
+  }
+
+  /**
+   * 取某一档的字节流（需要时先下载 + 解码）。
+   * tier = 'lite'（预览，约 1/8 体积）或 'full'（完整精度）。
+   */
+  async function loadTierBytes(i, tier, onProgress) {
+    const st = app.state[i];
+    const slot = st[tier];
+    if (slot.bytes) return slot.bytes;
+    const file = tier === 'lite' ? app.models[i].fileLite : app.models[i].file;
+    const payload = await fetchDeflated(file, onProgress);
+    slot.bytes = await decodePayload(payload);
+    return slot.bytes;
+  }
+
+  /** 用某一档的字节流构建 SplatMesh（不销毁其它档位，便于瞬时切换） */
+  async function buildTierMesh(i, tier) {
     const st = app.state[i];
     const m = app.models[i];
-    if (st.mesh) {
-      scene.remove(st.mesh);
-      try { st.mesh.dispose(); } catch (e) { /* 忽略 */ }
-      st.mesh = null;
+    const slot = st[tier];
+    if (slot.mesh) return slot.mesh;
+
+    let bytes = slot.bytes;
+    /* 兼容模式：完整档的球谐清零（预览档本来就没有球谐） */
+    if (app.compat && tier === 'full') {
+      bytes = st.noSh.full || (st.noSh.full = stripSh(bytes));
     }
-    const mesh = new SplatMesh({ fileBytes: bytes, fileName: m.name + '.ply' });
+    const mesh = new SplatMesh({ fileBytes: bytes, fileName: m.name + '-' + tier + '.ply' });
     /* 朝向修正：绕 X 轴 180°（Brush 导出的 PLY 在 Spark 里默认上下颠倒，见 README 6.2） */
     if (m.flipX) mesh.quaternion.set(1, 0, 0, 0);
+    /* 先隐藏：构建期间新旧两档会同时在场景里，避免叠加出重影 */
+    mesh.visible = false;
     scene.add(mesh);
-    st.mesh = mesh;
 
     if (mesh.initialized && typeof mesh.initialized.then === 'function') {
       try { await mesh.initialized; } catch (e) { throw new Error('高斯点云解析失败：' + ((e && e.message) || e)); }
     } else {
       await wait(2500);
     }
-    /* 校验真的解析出了点，否则 Spark 会静默失败、画面全黑 */
     let got = 0;
     try { got = mesh.getNumSplats ? mesh.getNumSplats() : 0; } catch (e) { got = 0; }
     if (!got && mesh.packedSplats) got = mesh.packedSplats.numSplats || 0;
     if (!got) throw new Error('高斯点云解析失败：结果为 0 个点（检查 PLY 表头与 f_rest 编号是否连续）');
+
+    slot.mesh = mesh;
+    return mesh;
   }
 
-  /** 按需下载 + 解码 + 构建第 i 个模型（未切换到的模型不会被加载） */
-  async function ensureMesh(i) {
+  function disposeTier(i, tier) {
+    const slot = app.state[i][tier];
+    if (slot.mesh) { scene.remove(slot.mesh); try { slot.mesh.dispose(); } catch (e) { } slot.mesh = null; }
+    slot.bytes = null;
+  }
+
+  /**
+   * 是否需要自动升级到完整档。
+   * 尊重「省流量」设置与极慢的网络：这类情况下只加载预览档。
+   */
+  function shouldAutoUpgrade() {
+    if (location.hash.indexOf('nolazy') >= 0) return true;    // 调试用：跳过预览档策略
+    const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (c) {
+      if (c.saveData) return false;
+      if (/^(slow-2g|2g)$/.test(c.effectiveType || '')) return false;
+    }
+    return true;
+  }
+
+  /** 后台把预览档升级为完整档：不阻塞操作，构建完成后无缝替换 */
+  async function upgradeToFull(i, silent) {
     const st = app.state[i];
     const m = app.models[i];
-
-    if (!st.bytes) {
-      setStatus('正在下载模型数据…', 0.02);
-      const payload = await fetchDeflated(m.file, (p) => setStatus('正在下载模型数据…', 0.02 + p * 0.5));
-      setStatus('正在解码…', 0.55);
-      await nextFrame();
-      st.bytes = unpackPly(payload);
+    if (!m.fileLite || st.full.mesh || st.upgrading) return;
+    st.upgrading = true;
+    updateHud();
+    try {
+      await loadTierBytes(i, 'full', (p) => setRowMeta(i, '高清 ' + Math.round(p * 100) + '%'));
+      setRowMeta(i, '准备中…');
+      await buildTierMesh(i, 'full');
+      st.active = 'full';
+      /* 预览档用完即弃，省内存与显存 */
+      disposeTier(i, 'lite');
+      if (app.cleanMode) await rebuildClean();
+      applyVisibility();
+      updateHud();
+      /* 首次拿到完整档时做一次色彩自检（预览档没有球谐，检查没意义） */
+      if (!app.checked) { app.checked = true; await firstFrameCheck(); }
+      if (!silent && app.current === i) showToast('已切换为完整精度', 2200);
+    } catch (e) {
+      console.warn('[viewer] 后台升级失败，继续使用预览档：', e);
     }
-    setStatus('正在构建高斯…', 0.75);
-    await nextFrame();
-    const source = app.compat ? (st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes))) : st.bytes;
-    await buildMesh(i, source);
-    /* 兼容模式切换后，去雾副本要重建 */
-    if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; }
+    st.upgrading = false;
+    defaultRowMeta(i);
+    updateHud();
   }
 
-  /** 切换 / 首次加载模型 */
+  /** 切换 / 首次加载模型：优先用预览档快速出画面，随后后台升级 */
   async function selectModel(i, first) {
     if (app.busy || (i === app.current && !first) || !app.models[i]) return;
     app.busy = true;
-    const needLoad = !app.state[i].mesh;
+    const m = app.models[i];
+    const st = app.state[i];
     const row = $('mlist').children[i];
-    if (needLoad) { showLoading('正在加载「' + app.models[i].name + '」'); row && row.classList.add('busy'); }
+    const needLoad = !st.lite.mesh && !st.full.mesh;
+    if (needLoad) { showLoading('正在加载「' + m.name + '」'); row && row.classList.add('busy'); }
     try {
-      await ensureMesh(i);
+      if (needLoad) {
+        /* 有预览档就先上预览档：约 1 MB，手机也能秒开 */
+        if (m.fileLite) {
+          setStatus('正在下载预览…', 0.05);
+          await loadTierBytes(i, 'lite', (p) => setStatus('正在下载预览…', 0.05 + p * 0.7));
+          setStatus('正在构建高斯…', 0.8);
+          await nextFrame();
+          await buildTierMesh(i, 'lite');
+          st.active = 'lite';
+        } else {
+          setStatus('正在下载模型数据…', 0.05);
+          await loadTierBytes(i, 'full', (p) => setStatus('正在下载模型数据…', 0.05 + p * 0.7));
+          setStatus('正在构建高斯…', 0.8);
+          await nextFrame();
+          await buildTierMesh(i, 'full');
+          st.active = 'full';
+        }
+      }
       app.current = i;
       frameModel(i);
       if (!first) app.cleanMode = false;
       syncButtons();
       applyVisibility();
       updateHud();
-      document.title = app.models[i].name + ' · 高斯泼溅模型展示';
+      document.title = m.name + ' · 高斯泼溅模型展示';
       if (needLoad && !app.checked) { app.checked = true; await firstFrameCheck(); }
     } catch (e) {
       fatalError('模型加载失败', (e && e.message) || String(e),
-        '检查 <code>assets/model.bin</code> 是否完整、是否与 <code>model.json</code> 配套。');
+        '检查 <code>' + (app.models[i].file || '') + '</code> 是否完整、是否与 <code>model.json</code> 配套。');
     }
     row && row.classList.remove('busy');
     app.busy = false;
     if (needLoad) hideLoading();
+    /* 首屏已经出来了，再开始后台拉完整档 */
+    if (st.active === 'lite' && !st.full.mesh && shouldAutoUpgrade()) upgradeToFull(i);
   }
 
   /**
    * [3] 首帧色彩自检 —— 个别机型会把球谐算花（几何正常、颜色变成彩虹）。
-   * 做法：渲染一帧后抽样读回画布像素，统计「高饱和像素占比」；
-   *       若明显异常，就清空球谐重建（兼容模式），并记住这个偏好。
+   *
+   * 关键点：**不能只看绝对饱和度**。这个模型本身偏雾、竖屏取景时整屏都是彩色，
+   * 直接卡阈值会误判。所以采用「自身对照」：
+   *   1. 先量一次当前（带球谐）画面的高饱和像素占比 s1；
+   *   2. 只有 s1 偏高时才额外构建一份「清空球谐」的同一模型，量出 s2；
+   *   3. 仅当 s2 明显比 s1 干净（< 60%）才判定为显卡把球谐算坏了，切到兼容模式。
+   * 这样彩色模型不会误伤，坏掉的设备也一定能被识别出来。
    */
   async function firstFrameCheck() {
     if (location.hash.indexOf('nocheck') >= 0) return;
-    if (!app.compat) {
-      const s = measureSaturation();
-      if (s != null && s > SATURATION_ALERT) {
-        console.warn('[viewer] 首帧色彩异常（高饱和像素 ' + (s * 100).toFixed(1) + '%），切换到兼容模式');
+    const i = app.current;
+    const st = app.state[i];
+    const slot = st.full;
+    if (app.compat || st.active !== 'full' || !slot.mesh || !slot.bytes) return;
+
+    const s1 = measureSaturation();
+    if (s1 == null || s1 <= SATURATION_ALERT) return;          // 画面看着正常
+    console.warn('[viewer] 首帧高饱和像素 ' + (s1 * 100).toFixed(1) + '%，做对照检测…');
+
+    let probe = null;
+    try {
+      const noSh = st.noSh.full || (st.noSh.full = stripSh(slot.bytes));
+      probe = new SplatMesh({ fileBytes: noSh, fileName: app.models[i].name + '-probe.ply' });
+      if (app.models[i].flipX) probe.quaternion.set(1, 0, 0, 0);
+      probe.visible = false;
+      scene.add(probe);
+      if (probe.initialized && typeof probe.initialized.then === 'function') await probe.initialized;
+      else await wait(2500);
+      slot.mesh.visible = false;
+      probe.visible = true;
+      const s2 = measureSaturation();
+      console.warn('[viewer] 对照：带球谐 ' + (s1 * 100).toFixed(1) + '% vs 无球谐 ' + (s2 == null ? '?' : (s2 * 100).toFixed(1) + '%'));
+      if (s2 != null && s2 < s1 * 0.6) {
+        /* 确认是球谐被算坏：直接复用这份对照网格作为兼容版本 */
+        scene.remove(slot.mesh);
+        try { slot.mesh.dispose(); } catch (e) { }
+        slot.bytes = noSh;
+        slot.mesh = probe;
+        probe = null;
         app.compat = true;
         writeCompatPref(true);
-        const st = app.state[app.current];
-        await buildMesh(app.current, st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes)));
-        syncButtons(); updateHud();
-        const s2 = measureSaturation();
-        showToast('检测到显卡渲染异常，已自动开启「兼容模式」' + (s2 != null ? '（异常像素 ' + (s * 100).toFixed(0) + '% → ' + (s2 * 100).toFixed(0) + '%）' : ''));
+        if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; app.cleanMode = false; }
+        syncButtons(); applyVisibility(); updateHud();
+        showToast('检测到显卡渲染异常，已自动开启「兼容模式」（关闭视角相关颜色）', 6500);
+      } else {
+        /* 只是画面本身色彩丰富，恢复原样 */
+        probe.visible = false;
+        scene.remove(probe);
+        try { probe.dispose(); } catch (e) { }
+        probe = null;
+        slot.mesh.visible = true;
+        applyVisibility();
       }
+    } catch (e) {
+      console.warn('[viewer] 对照检测失败：', e);
+      if (probe) { scene.remove(probe); try { probe.dispose(); } catch (e2) { } }
+      if (slot.mesh) slot.mesh.visible = st.active === 'full';
+      applyVisibility();
     }
   }
 
@@ -547,47 +728,59 @@ async function main() {
     }
   }
 
-  /** 兼容模式开关（手动） */
+  /** 兼容模式开关（手动）：只影响完整档（预览档本来就没有球谐） */
   async function setCompat(on, silent) {
     if (app.busy || app.current < 0 || app.compat === on) { syncButtons(); return; }
+    const i = app.current, st = app.state[i];
+    /* 预览档没有球谐可关，直接记住偏好即可 */
+    if (st.active !== 'full' || !st.full.bytes) {
+      app.compat = on;
+      writeCompatPref(on);
+      syncButtons(); updateHud();
+      if (!silent) showToast(on ? '已开启兼容模式（将在加载完整精度时生效）' : '已关闭兼容模式');
+      return;
+    }
     app.busy = true;
-    const st = app.state[app.current];
-    if (on) {
-      if (!st.bytesNoSh) {
-        setStatus('正在生成兼容版本…', 0.6);
-        showLoading('正在生成兼容版本');
-        syncButtons(); updateHud();
-        await nextFrame();
-        st.bytesNoSh = stripSh(st.bytes);
+    app.compat = on;
+    showLoading(on ? '正在生成兼容版本' : '正在恢复');
+    await nextFrame();
+    try {
+      const slot = st.full;
+      if (on) {
+        slot.bytes = st.noSh.full || (st.noSh.full = stripSh(slot.bytes));
+      } else {
+        /* 关掉兼容：重新下载/解码一次原始完整档（副本已释放） */
+        slot.bytes = null;
+        await loadTierBytes(i, 'full');
+        st.noSh.full = null;
       }
-      app.compat = true;
-      try { await buildMesh(app.current, st.bytesNoSh); } catch (e) { fatalError('兼容模式构建失败', (e && e.message) || String(e)); }
-      hideLoading();
-    } else {
-      app.compat = false;
-      try { await buildMesh(app.current, st.bytes); } catch (e) { fatalError('恢复失败', (e && e.message) || String(e)); }
-      st.bytesNoSh = null;                 // 释放副本
+      if (slot.mesh) { scene.remove(slot.mesh); try { slot.mesh.dispose(); } catch (e) { } slot.mesh = null; }
+      await buildTierMesh(i, 'full');
+    } catch (e) {
+      fatalError('兼容模式切换失败', (e && e.message) || String(e));
     }
     writeCompatPref(app.compat);
     if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; app.cleanMode = false; }
     syncButtons(); applyVisibility(); updateHud();
+    hideLoading();
     app.busy = false;
     if (!silent) showToast(app.compat ? '已开启兼容模式：关闭视角相关颜色，画面更稳但略平' : '已关闭兼容模式');
   }
 
-  /** 去雾开关：懒生成过滤后的副本 */
+  /** 去雾开关：懒生成过滤后的副本（基于当前显示的档位） */
   async function setClean(on) {
     if (app.busy || app.current < 0) return;
     const i = app.current, st = app.state[i];
-    if (on && !st.clean && st.bytes) {
+    if (on && (!st.clean || st.cleanFrom !== st.active) && st[st.active] && st[st.active].bytes) {
       app.busy = true;
       const btn = $('btn-clean');
       btn.classList.add('busy');
       await nextFrame();
-      const base = app.compat ? (st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes))) : st.bytes;
-      const res = filterHaze(base, HAZE_LOG_SCALE);
+      if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; }
+      const res = filterHaze(st[st.active].bytes, HAZE_LOG_SCALE);
       if (res) {
         st.cleanCount = res.count;
+        st.cleanFrom = st.active;
         const mesh = new SplatMesh({ fileBytes: res.bytes, fileName: 'clean.ply' });
         if (app.models[i].flipX) mesh.quaternion.set(1, 0, 0, 0);
         scene.add(mesh);
@@ -601,6 +794,18 @@ async function main() {
     }
     app.cleanMode = !!on && !!st.clean;
     syncButtons(); applyVisibility(); updateHud();
+  }
+
+  /** 档位切换后重建去雾副本（升级到完整档时用） */
+  async function rebuildClean() {
+    const st = app.state[app.current];
+    if (!st.clean) return;
+    scene.remove(st.clean);
+    try { st.clean.dispose(); } catch (e) { }
+    st.clean = null;
+    const was = app.cleanMode;
+    app.cleanMode = false;
+    if (was) await setClean(true);
   }
 
   function syncButtons() {
@@ -785,17 +990,24 @@ async function main() {
   /* 供自动化测试与排障使用（控制台里也能直接查状态） */
   window.__viewer = {
     THREE, scene, camera, renderer, spark, app, cam,
-    get splats() { return app.current >= 0 ? app.state[app.current].mesh : null; },
+    /** 当前显示的 mesh（预览档或完整档） */
+    get splats() {
+      const st = app.current >= 0 ? app.state[app.current] : null;
+      return st && st.active ? st[st.active].mesh : null;
+    },
     selectModel, setView, orbit, zoomBy, pan, applyCamera, frameModel, setClean, setCompat, resetView,
-    measureSaturation, stripSh,
+    measureSaturation, stripSh, upgradeToFull, loadTierBytes, buildTierMesh,
+    /** 当前显示档位的点数 */
     numSplats() {
       const st = app.current >= 0 ? app.state[app.current] : null;
-      if (!st || !st.mesh) return 0;
+      if (!st || !st.active) return 0;
+      const mesh = st[st.active].mesh;
       try {
-        if (st.mesh.getNumSplats && st.mesh.getNumSplats()) return st.mesh.getNumSplats();
-        if (st.mesh.packedSplats && st.mesh.packedSplats.numSplats) return st.mesh.packedSplats.numSplats;
+        if (mesh && mesh.getNumSplats && mesh.getNumSplats()) return mesh.getNumSplats();
+        if (mesh && mesh.packedSplats && mesh.packedSplats.numSplats) return mesh.packedSplats.numSplats;
       } catch (e) { /* ignore */ }
-      return app.models[app.current].count;
+      const m = app.models[app.current];
+      return st.active === 'lite' ? (m.liteCount || m.count) : m.count;
     }
   };
 
@@ -843,3 +1055,4 @@ function writeCompatPref(on) {
 main().catch((e) => {
   fatalError('初始化失败', (e && e.stack) ? String(e.stack).split('\n').slice(0, 3).join('<br>') : String(e));
 });
+

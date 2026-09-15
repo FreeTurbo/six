@@ -4,7 +4,7 @@
 展示一个由手机视频训练出来的高斯泼溅（3D Gaussian Splatting）模型。
 
 **当前模型**：楼梯间 · 17:43 —— 227,933 个高斯点，源文件 `VID_20260914_174313.ply`（Brush 导出）
-**整站体积**：约 13 MB（其中 HTML 只有 3 KB，模型数据 9.7 MB 单独存放）
+**整站体积**：约 14.4 MB（HTML 6 KB，预览档 1.26 MB + 完整档 9.7 MB 单独存放，引擎 3.4 MB）
 **兼容**：Chrome / Edge 103+、Safari 16.4+（需要 `DecompressionStream`）
 
 ---
@@ -17,17 +17,18 @@
 ├── style.css               界面样式：iOS 风格玻璃材质、动效、双端响应式
 ├── app.js                  查看器逻辑：[1]工具 [2]相机 [3]模型管理 [4]界面联动 [5]设备兼容
 ├── assets/
-│   ├── model.json          ★ 模型清单：名称 / 点数 / 朝向 / 默认视角 / 取景范围
-│   ├── model.bin           ★ 量化 + deflate 的模型数据（9.7 MB，格式见 tools/pack.mjs）
-│   ├── three.module.js     three.js r180（705 KB）
-│   ├── Pass.js             three.js addons（Spark 依赖，4 KB）
-│   └── spark.module.js     Spark 2.2.0（2.7 MB，MIT）
+│   ├── model.json           ★ 模型清单：名称 / 点数 / 朝向 / 默认视角 / 取景范围 / 两档文件名
+│   ├── model-1.bin          ★ 完整档：量化 + deflate 的模型数据（9.7 MB，格式见 tools/pack.mjs）
+│   ├── model-1.lite.bin     ★ 预览档：1.26 MB，首屏秒开用（见 6.6）
+│   ├── three.module.js      three.js r180（705 KB）
+│   ├── Pass.js              three.js addons（Spark 依赖，4 KB）
+│   └── spark.module.js      Spark 2.2.0（2.7 MB，MIT）
 ├── tools/
-│   ├── build.mjs           PLY → model.bin + model.json（换模型就用它）
-│   ├── pack.mjs            量化打包核心 + 二进制格式说明（★ 改格式前必读）
-│   ├── verify.mjs          往返校验：确认 model.bin 解码结果与原始 PLY 一致
-│   ├── serve.mjs           本地静态预览服务器（零依赖）
-│   └── push.ps1            一键提交并推送到 GitHub（配合根目录的 .bat）
+│   ├── build.mjs            PLY → 两档 bin + model.json（换模型就用它）
+│   ├── pack.mjs             量化打包核心 + 二进制格式说明（★ 改格式前必读）
+│   ├── verify.mjs           往返校验：确认 bin 解码结果与原始 PLY 一致
+│   ├── serve.mjs            本地静态预览服务器（零依赖，内置 gzip）
+│   └── push.ps1             一键提交并推送到 GitHub（配合根目录的 .bat）
 ├── .gitignore              忽略原始 .ply 等大文件
 └── README.md               本文件
 ```
@@ -94,18 +95,22 @@ powershell -ExecutionPolicy Bypass -File tools\push.ps1 -Message "自定义提�
 ## 3. 换模型 / 加模型
 
 ```bash
-# 换成新模型（会覆盖 model.bin，并更新 model.json 里的对应条目）
+# 换成新模型（会覆盖同 id 的两档文件，并更新 model.json 里的对应条目）
 node tools/build.mjs 你的模型.ply
 
 # 常用选项
 node tools/build.mjs 模型.ply --name "展厅 · 09:30"    # 展示名称
-node tools/build.mjs 模型.ply --sh 1                   # 球谐降到 1 阶（体积更小）
+node tools/build.mjs 模型.ply --sh 1                   # 完整档球谐降到 1 阶（体积更小）
 node tools/build.mjs 模型.ply --id model-2             # 追加为另一个模型（保留已有条目）
+node tools/build.mjs 模型.ply --lite-points 50000      # 预览档只保留 5 万点（默认 35%）
+node tools/build.mjs 模型.ply --no-lite                # 不生成预览档（只有完整档）
 node tools/build.mjs 模型.ply --flip / --noflip        # 显式指定朝向
 
 # 校验（推荐每次打包后跑一次）
 node tools/verify.mjs 你的模型.ply
 ```
+
+产物：`assets/<id>.bin`（完整档）、`assets/<id>.lite.bin`（预览档）、`assets/model.json`。
 
 打包完成后：
 
@@ -120,14 +125,16 @@ node tools/verify.mjs 你的模型.ply
 | 字段 | 说明 |
 |---|---|
 | `name` | 展示名称，显示在左上角 HUD |
-| `file` | 数据文件路径（相对站点根目录） |
-| `count` | 点数，仅用于显示 |
+| `file` | 完整档数据路径（相对站点根目录） |
+| `fileLite` | 预览档路径；为空表示没有预览档，启动时直接加载完整档 |
+| `count` / `liteCount` | 两档的点数，仅用于显示 |
+| `bytes` / `liteBytes` | 两档的压缩后字节数，可用于估算加载时间 |
 | `flipX` | 是否绕 X 轴 180°（修正上下颠倒），见 6.2 |
 | `yaw` | 默认水平角，弧度。`0` = 从 +Z 方向看，`π` = 从 −Z 方向看 |
 | `pitch` | 默认俯仰角，弧度。`π/2 ≈ 1.571` 为水平，越小越俯视 |
 | `frame` | 自动取景用的稳健包围盒（坐标 1%~99% 分位），由打包脚本算出 |
 
-> 有 2 个及以上模型时，右上角会自动出现「模型列表」；只有 1 个时该面板隐藏（`app.js` [2.10] 节，判据 `app.models.length > 1`）。
+> 模型列表常驻显示；只有 1 个模型时就是一行，加到 2 个及以上会自动变成多行（窄屏是横向胶囊条）。
 
 ---
 
@@ -142,12 +149,19 @@ node tools/verify.mjs 你的模型.ply
 
 球谐阶数与体积的取舍（以本项目 22.8 万点为例，单位 MB）：
 
-| 阶数 | 系数/通道 | model.bin |
+| 阶数 | 系数/通道 | 完整档 `*.bin` |
 |---|---|---|
 | SH0 | 0 | 5.0 |
 | SH1 | 3 | 7.0 |
 | **SH2（当前）** | **8** | **9.7** |
 | SH3 | 15 | 14.8 |
+
+预览档 `*.lite.bin` 走的是另一套位宽（位置 16bit、尺度 8bit、不含球谐），
+每个点只要 17 字节，所以能把 22.8 万点压到 1.26 MB。
+
+> ⚠ 部署提示：`.js/.css/.html` 请让服务器开 gzip。GitHub Pages 默认就会压缩，
+> 但**自建服务器如果没开，光引擎就有 3.4 MB**，首屏会明显变慢。
+> 本地预览用的 `tools/serve.mjs` 已经内置 gzip，测速结果与线上一致。
 
 ---
 
@@ -229,10 +243,12 @@ Spark 直接抛 `Invalid number of f_rest properties: N` 并且**静默加载出
 2. **降低对驱动路径的依赖**：不用 `powerPreference: 'high-performance'`；
    像素比加上「总像素数上限」（手机会自动降采样），减轻显存与填充率压力；
    氛围层不再使用 `mix-blend-mode`（见 6.5）。
-3. **首帧色彩自检 + 自动降级**（`app.js` [3]）：渲染完首帧后抽样读回画布像素，
-   统计「高饱和像素占比」。正常画面是 0~5%，彩虹画面通常 > 40%。
-   超过 30% 就自动清空球谐重建（退化成固定的 DC 颜色），弹提示告知用户，
-   并把偏好写进 `localStorage`，下次直接以兼容模式启动，不再先闪一下错的画面。
+3. **首帧色彩自检 + 自动降级**（`app.js` [3]）：这里用「自身对照」而不是单纯卡阈值 ——
+   这个模型本身偏雾、竖屏取景时整屏都是彩色，只看绝对饱和度会误判。
+   做法是：先量当前（带球谐）画面的高饱和像素占比 `s1`；偏高时才额外构建一份
+   「清空球谐」的同款模型量出 `s2`；**只有 `s2` 明显更干净（< 0.6×`s1`）才判定为
+   显卡把球谐算坏了**，此时切到兼容模式并写入 `localStorage`，下次直接以兼容模式启动。
+   彩色模型不会误伤，坏设备也一定能识别出来。
 
 工具栏上的「兼容」按钮可手动开关（自动触发后也能一键关掉）。
 兼容模式只是少了视角相关的高光变化，画面明显更稳，其余完全一致。
@@ -247,12 +263,43 @@ Spark 直接抛 `Invalid number of f_rest properties: N` 并且**静默加载出
 早期版本的氛围层用了 `mix-blend-mode: screen`，在部分安卓浏览器上会把整屏画布混合成偏色。
 现在改成普通叠加（`style.css` 的 `#glow`），只靠极低透明度的渐变营造氛围。
 
-### 6.6 按需加载：启动时不下载所有模型
+### 6.6 渐进加载：先出预览档，再后台升级到完整档（★ 移动端体验的关键）
 
-`app.js` 的 `ensureMesh(i)` 只在**第一次切换到某个模型时**才去 fetch 它的 `.bin`：
-`model.json` 只有几 KB，启动时只加载列表里的第一个模型，其余模型保持「未下载、未解码」。
-`app.state[i]` 里 `mesh / bytes` 都为空即表示没加载过；加载过一次后常驻，来回切换是瞬时的。
-`tools/../lazytest` 的验证结论：启动时网络请求里只有 1 个 `model.bin`。
+手机端的瓶颈是「下载 + 解码 + 上传 GPU」三段叠加，一次拉 9.7 MB 要白等好几秒。
+所以每个模型都打成**两档**，运行时先用小的把画面顶出来，再在后台换成高清：
+
+| 档位 | 内容 | 本项目体积 | 用途 |
+|---|---|---|---|
+| 预览 `*.lite.bin` | 总数 35% 的点（空间均匀抽样）、无球谐、16bit 位置 | **1.26 MB** | 首屏，手机也能秒开 |
+| 完整 `*.bin` | 全部点、SH2、24bit 位置 | 9.72 MB | 高清，随后自动换上 |
+
+时序（本机实测，桌面与手机模拟结果接近）：
+
+```
+0.28s  预览档可见（可交互，已经在转、已经在看）
+1.92s  完整档就绪并无缝替换，提示「已切换为完整精度」
+```
+
+慢网下同样成立：模拟 1.5 Mbps 时预览档 6.9s 出画面、完整档 7.3s 就绪 ——
+对比「一次性下载 9.7 MB」的老方案（同条件 25.9s 才有画面）快了约 3.7 倍。
+
+实现要点（都在 `app.js`）：
+
+* **按需加载**：`model.json` 只有几 KB；启动时只加载第一个模型的**预览档**，
+  其它模型、以及所有完整档都要等真正用到才下载（`loadTierBytes` / `buildTierMesh`）。
+* **解码放进 Worker**：后台升级若占用主线程，页面会卡住 1~2 秒。`unpackPly` 是纯函数，
+  直接把它的源码 `toString()` 塞进 Blob Worker 里跑（`decodePayload`），主线程全程不阻塞；
+  Worker 不可用时自动退回主线程。
+* **无缝替换**：新档位的 mesh 先隐藏着构建，构建完成才切可见性并释放旧档，
+  期间不会重影、不会空白（`buildTierMesh` 里的 `mesh.visible = false`）。
+* **省流量**：`navigator.connection.saveData` 为真、或网络是 2G 时不会自动升级，
+  只保留预览档（`shouldAutoUpgrade`）。
+* **状态可见**：列表行右侧显示「高清 45%」进度，HUD 显示「预览 · 正在加载高清」。
+* 构建时用 `--lite-ratio` / `--lite-points` 调整预览档大小，`--no-lite` 关闭该功能。
+
+> 预览档的抽样是 **Morton 码等间隔抽样**（`pack.mjs` 的 `mortonSample`），不是随机抽样、
+> 也不是按不透明度挑：这样预览与完整档是「同一个模型、密度低一些」，升级时观感连续。
+> 随机抽样容易出现局部空洞；按不透明度挑则会先把雾状点丢掉，切到完整档时观感突变。
 
 ### 6.7 去雾功能
 
@@ -287,7 +334,8 @@ Spark 直接抛 `Invalid number of f_rest properties: N` 并且**静默加载出
 
 | 版本 | 变更 |
 |---|---|
-| v5（当前） | **修复个别安卓机整屏彩虹色问题**：显式声明色彩空间、去掉 `mix-blend-mode`、降像素比上限、新增首帧色彩自检与自动降级；新增手动「兼容」按钮；**模型改为按需加载**（启动只加载列表第一个，切换才下载），模型列表改为常驻并支持多模型；UI 全面重做：iOS 风格玻璃材质、5 键图标工具栏、移动端横向胶囊列表、toast 提示、`supported-color-schemes` 防强制深色；页面标题不再显示调试信息 |
+| v6（当前） | **移动端渐进加载**：每个模型打成「预览档（1.26 MB，秒开）+ 完整档（9.7 MB，后台自动换上）」两档，首屏从数秒降到 0.3s 量级；解码移入 Worker 不再卡主线程；新增「省流量」判断；`tools/serve.mjs` 补上 gzip（与 GitHub Pages 一致）；色彩自检改为**自身对照**，修掉竖屏雾状场景被误判成「显卡异常」的问题；构建与升级期间不再出现重影 |
+| v5 | **修复个别安卓机整屏彩虹色问题**：显式声明色彩空间、去掉 `mix-blend-mode`、降像素比上限、新增首帧色彩自检与自动降级；新增手动「兼容」按钮；**模型改为按需加载**（启动只加载列表第一个，切换才下载），模型列表改为常驻并支持多模型；UI 全面重做：iOS 风格玻璃材质、5 键图标工具栏、移动端横向胶囊列表、toast 提示、`supported-color-schemes` 防强制深色；页面标题不再显示调试信息 |
 | v4 | 只保留「楼梯间」模型；改为 `index.html + style.css + app.js + assets/` 分离结构，HTML 从 20 MB 降到 3 KB；UI 换成液态玻璃并加入动效；桌面端与移动端分别适配；禁用右键平移；**修正模型上下颠倒**（经 COLMAP 位姿与源照片比对验证）；补 favicon、错误面板、调试接口、`tools/` 工具链与本文件 |
 | v3 | 双模型 + 右上角切换列表；为塞进 25 MB 把球谐从 3 阶降到 2 阶；修复 `f_rest` 断号导致 Spark 静默加载 0 点的问题 |
 | v2 | 引入量化 + deflate（29.7 MB → 8.6 MB）；去雾开关默认关闭；视角旋转取消天顶限制 |
@@ -300,14 +348,17 @@ Spark 直接抛 `Invalid number of f_rest properties: N` 并且**静默加载出
 | 现象 | 原因 / 处理 |
 |---|---|
 | 打开是白屏，提示 `file://` | 用了双击打开。起本地服务器，见第 2 节 |
-| 一直卡在「正在下载模型数据」 | `assets/model.bin` 路径不对或没上传；看浏览器网络面板 |
+| 一直卡在「正在下载模型数据」 | `assets/model-1.bin` 路径不对或没上传；看浏览器网络面板 |
+| 手机打开很慢 | 确认服务器对 `.js` 开了 gzip（GitHub Pages 默认开）；再看预览档 `*.lite.bin` 是否生成了（6.6） |
+| 切换模型要等几秒 | 正常：数据是切换时才下载的（6.6）。同一个模型第二次切换是瞬时的 |
+| 画面先是糊一些、随后变清楚 | 正常：这是「预览档 → 完整档」的渐进加载（6.6），右下角会有提示 |
 | 提示「高斯点云解析失败：结果为 0 个点」 | PLY 表头问题，多半是 `f_rest` 编号不连续，见 6.3 |
 | **颜色变成彩虹色 / 整屏偏色** | 见 6.4：先点「兼容」按钮；若整页 UI 也被反色，是浏览器的强制深色模式，去设置里关掉 |
 | 模型侧躺 / 上下颠倒 | 朝向问题，见 6.2 |
 | 模型很小、缩在画面中间 | `model.json` 的 `frame` 不对，重新跑 `build.mjs` |
 | 切换模型要等几秒 | 正常：数据是切换时才下载的（6.6）。同一个模型第二次切换是瞬时的 |
 | 改了 `pack.mjs` 后画面异常 | 跑 `node tools/verify.mjs <原始PLY>` 看误差表 |
-| 想调试相机/模型状态 | 控制台里有 `__viewer`（`__viewer.cam`、`__viewer.splats`、`__viewer.app.state`），URL 加 `#haze` / `#autorotate` / `#nocheck` 可切换默认行为 |
+| 想调试相机/模型状态 | 控制台里有 `__viewer`（`__viewer.cam`、`__viewer.splats`、`__viewer.app.state`、`__viewer.loadTierBytes`），URL 加 `#haze` / `#autorotate` / `#nocheck` / `#nolazy` 可切换默认行为 |
 
 ---
 
@@ -316,3 +367,4 @@ Spark 直接抛 `Invalid number of f_rest properties: N` 并且**静默加载出
 * [three.js](https://threejs.org/) — MIT
 * [Spark](https://github.com/sparkjsdev/spark)（World Labs）— MIT
 * 模型数据与源视频版权归模型作者所有。
+

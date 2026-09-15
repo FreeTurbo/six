@@ -48,9 +48,35 @@
  *   顺序仍是「通道优先」（R 的系数在前，然后 G、B），与标准 3DGS 布局一致。
  *
  *   实测 Spark 只接受 f_rest 个数 = 0 / 9 / 24 / 45（连续编号），其余一律拒绝。
+ *
+ * ---------------------------------------------------------------------------
+ * 档位（profile）—— 用于「先快速进画面，再后台升级到高清」
+ * ---------------------------------------------------------------------------
+ *   full  位置 u24 + 尺度 u16 + 旋转 q8 + 不透明度 u8 + 颜色 u8×3 + 球谐 u8×K
+ *         本项目 22.8 万点、SH2 → 约 9.7 MB，画质最好
+ *   lite  位置 u16 + 尺度 u8  + 旋转 q8 + 不透明度 u8 + 颜色 u8×3（不含球谐）
+ *         只保留一部分点（默认为总数 35%，按空间均匀抽样，避免局部空洞）
+ *         → 约 1 MB，用于首屏秒开；随后由浏览器后台下载 full 并无缝替换
+ *
+ *   lite 的位置用 0.05%~99.95% 分位（把极少数远处漂浮点截断）以换取更高精度，
+ *   其余属性用 0.2%~99.8% 分位，避免离群值吃掉动态范围。
  */
 
 export const SH_COEFS = { 0: 0, 1: 9, 2: 24, 3: 45 };   // 每通道 (D+1)²-1 个系数
+
+/** 档位定义：记录区字段顺序不变，只改位宽、取值范围与是否带球谐 */
+export const PROFILES = {
+  full: {
+    label: '完整',
+    types: { pos: 'u24', scale: 'u16', rot: 'q8', opacity: 'u8', dc: 'u8', rest: 'u8' },
+    range: { pos: 'full', scale: 'full', rot: null, opacity: 'full', dc: 'full', rest: 'robust' }
+  },
+  lite: {
+    label: '预览',
+    types: { pos: 'u16', scale: 'u8', rot: 'q8', opacity: 'u8', dc: 'u8', rest: null },
+    range: { pos: 'tight', scale: 'robust', rot: null, opacity: 'full', dc: 'full', rest: null }
+  }
+};
 
 /** 解析标准 3DGS PLY（binary_little_endian），返回表头、属性表与 float 视图 */
 export function parsePly(buf) {
@@ -72,11 +98,58 @@ export function parsePly(buf) {
 }
 
 const rangeFull = (a) => { let lo = Infinity, hi = -Infinity; for (let i = 0; i < a.length; i++) { if (a[i] < lo) lo = a[i]; if (a[i] > hi) hi = a[i]; } return [lo, hi]; };
-/* 稳健范围：球谐里个别离群值会毁掉整条系数的精度，取 0.2%~99.8% 分位并截断 */
+/* 稳健范围：个别离群值会毁掉整条系数的精度，取 0.2%~99.8% 分位并截断 */
 const rangeRobust = (a) => {
   const b = Float64Array.from(a).sort();
   return [b[Math.floor(b.length * 0.002)], b[Math.min(b.length - 1, Math.floor(b.length * 0.998))]];
 };
+/* 更紧的范围：给低比特位宽的位置用，牺牲极少数远处漂浮点换取精度 */
+const rangeTight = (a) => {
+  const b = Float64Array.from(a).sort();
+  return [b[Math.floor(b.length * 0.0005)], b[Math.min(b.length - 1, Math.floor(b.length * 0.9995))]];
+};
+const RANGE_FN = { full: rangeFull, robust: rangeRobust, tight: rangeTight };
+
+/**
+ * 空间均匀抽样：把坐标量化到 10bit 网格后按 Morton 码排序，再等间隔取点。
+ * 比随机抽样更均匀（不会出现局部空洞），也比按不透明度排序更「保形」
+ * ——预览版要和完整版看起来是同一个模型，只是密度低一些。
+ * 返回按 Morton 码排好序的下标数组；不需要抽样时返回 null。
+ */
+export function mortonSample(P, maxPoints) {
+  const { count, stride, f, props } = P;
+  if (!maxPoints || count <= maxPoints) return null;
+  const ix = props.indexOf('x'), iy = props.indexOf('y'), iz = props.indexOf('z');
+  /* 用 0.1%~99.9% 分位做量化范围，避免个别漂浮点把网格撑爆 */
+  const box = [ix, iy, iz].map((i) => {
+    const a = new Float64Array(count);
+    for (let k = 0; k < count; k++) a[k] = f[k * stride + i];
+    const b = Float64Array.from(a).sort();
+    return [b[Math.floor(count * 0.001)], b[Math.min(count - 1, Math.floor(count * 0.999))]];
+  });
+  const keys = new Float64Array(count);
+  const order = new Uint32Array(count);
+  const part1by2 = (v) => {           // 把 10bit 均匀铺开到 30bit（Morton 交错）
+    v &= 0x3ff;
+    v = (v | (v << 16)) & 0x030000ff;
+    v = (v | (v << 8)) & 0x0300f00f;
+    v = (v | (v << 4)) & 0x030c30c3;
+    v = (v | (v << 2)) & 0x09249249;
+    return v;
+  };
+  for (let k = 0; k < count; k++) {
+    const qx = Math.min(1023, Math.max(0, Math.round((f[k * stride + ix] - box[0][0]) / ((box[0][1] - box[0][0]) / 1023 || 1))));
+    const qy = Math.min(1023, Math.max(0, Math.round((f[k * stride + iy] - box[1][0]) / ((box[1][1] - box[1][0]) / 1023 || 1))));
+    const qz = Math.min(1023, Math.max(0, Math.round((f[k * stride + iz] - box[2][0]) / ((box[2][1] - box[2][0]) / 1023 || 1))));
+    keys[k] = part1by2(qx) | (part1by2(qy) << 1) | (part1by2(qz) << 2);
+    order[k] = k;
+  }
+  const idx = Array.from(order).sort((a, b) => keys[a] - keys[b]);
+  const step = count / maxPoints;
+  const out = new Uint32Array(maxPoints);
+  for (let i = 0; i < maxPoints; i++) out[i] = idx[Math.min(count - 1, Math.floor(i * step))];
+  return out;
+}
 
 /** 按球谐阶数挑出要保留的 f_rest 属性名（每通道前 K 个系数，通道优先） */
 export function restNamesFor(degree, props) {
@@ -92,28 +165,50 @@ export function restNamesFor(degree, props) {
   return out;
 }
 
-/** PLY Buffer → { payload, REC, count, degree, restCount, props } */
-export function buildPayload(plyBuf, { degree = 2 } = {}) {
+/**
+ * PLY Buffer → { payload, REC, count, degree, restCount, props, profile, srcCount }
+ *
+ * 选项：
+ *   degree    球谐阶数（0~3），仅 profile='full' 时生效
+ *   profile   'full' | 'lite'，见文件头的档位说明
+ *   maxPoints 只对 lite 生效：最多保留多少个点（默认取总数的 35%）
+ */
+export function buildPayload(plyBuf, { degree = 2, profile = 'full', maxPoints = 0 } = {}) {
   const P = parsePly(plyBuf);
-  const { props, count, stride, f, col } = P;
-  const restSrc = restNamesFor(degree, props);
-  const restOut = restSrc.map((_, i) => 'f_rest_' + i);   // 重新连续编号（见文件头说明）
+  const { props, stride, f, col } = P;
+  const prof = PROFILES[profile];
+  if (!prof) throw new Error('未知档位：' + profile);
+
+  /* 预览档默认按总数 35% 抽样；完整档不抽样 */
+  const keepIdx = profile === 'lite'
+    ? mortonSample(P, maxPoints || Math.max(20000, Math.round(P.count * 0.35)))
+    : null;
+  const count = keepIdx ? keepIdx.length : P.count;
+  const pick = (k) => (keepIdx ? keepIdx[k] : k);          // 逻辑下标 → 源下标
+
+  const restSrc = prof.types.rest ? restNamesFor(degree, props) : [];
+  const restOut = restSrc.map((_, i) => 'f_rest_' + i);     // 重新连续编号（见文件头说明）
 
   const GROUPS = [
-    { type: 'u24', props: ['x', 'y', 'z'], mode: 'full' },
-    { type: 'u16', props: ['scale_0', 'scale_1', 'scale_2'], mode: 'full' },
+    { type: prof.types.pos, props: ['x', 'y', 'z'], mode: prof.range.pos },
+    { type: prof.types.scale, props: ['scale_0', 'scale_1', 'scale_2'], mode: prof.range.scale },
     { type: 'q8', props: ['rot_0', 'rot_1', 'rot_2', 'rot_3'] },
-    { type: 'u8', props: ['opacity'], mode: 'full' },
-    { type: 'u8', props: ['f_dc_0', 'f_dc_1', 'f_dc_2'], mode: 'full' },
+    { type: 'u8', props: ['opacity'], mode: prof.range.opacity },
+    { type: 'u8', props: ['f_dc_0', 'f_dc_1', 'f_dc_2'], mode: prof.range.dc },
     { type: 'u8', props: restSrc, out: restOut, mode: 'robust' }
   ];
-  if (restSrc.length === 0) GROUPS.pop();
+  if (!restSrc.length) GROUPS.pop();
 
   const RANGES = [], rangeBase = [];
   for (const g of GROUPS) {
     if (g.type === 'q8') { rangeBase.push(null); continue; }
     rangeBase.push(RANGES.length);
-    for (const p of g.props) RANGES.push(g.mode === 'robust' ? rangeRobust(col(p)) : rangeFull(col(p)));
+    for (const p of g.props) {
+      const c = col(p);
+      /* 抽样时只统计被保留下来的点，范围更贴合实际数据 */
+      const src = keepIdx ? Float64Array.from(keepIdx, (k) => c[k]) : c;
+      RANGES.push((RANGE_FN[g.mode] || rangeFull)(src));
+    }
   }
 
   const widths = { u24: 3, u16: 2, q8: 1, u8: 1 };
@@ -124,25 +219,34 @@ export function buildPayload(plyBuf, { degree = 2 } = {}) {
   const u8e = (v, lo, hi) => { const t = (v - lo) / (hi - lo || 1); return t <= 0 ? 0 : t >= 1 ? 255 : Math.round(t * 255); };
   const u16e = (v, lo, hi) => { const t = (v - lo) / (hi - lo || 1); return t <= 0 ? 0 : t >= 1 ? 65535 : Math.round(t * 65535); };
   const u24e = (v, lo, hi) => { const t = (v - lo) / (hi - lo || 1); return t <= 0 ? 0 : t >= 1 ? 16777215 : Math.round(t * 16777215); };
+  const ENC = { u8: u8e, u16: u16e, u24: u24e };
+  const BYTES = { u8: 1, u16: 2, u24: 3 };
 
   const idx = GROUPS.map((g) => g.props.map((n) => props.indexOf(n)));
   const rb = rangeBase;
   for (let k = 0; k < count; k++) {
-    const o = k * stride;
+    const o = pick(k) * stride;
     let w = k * REC;
-    for (let j = 0; j < 3; j++) { const v = u24e(f[o + idx[0][j]], RANGES[rb[0] + j][0], RANGES[rb[0] + j][1]); rec[w] = v & 255; rec[w + 1] = (v >> 8) & 255; rec[w + 2] = (v >> 16) & 255; w += 3; }
-    for (let j = 0; j < 3; j++) { const v = u16e(f[o + idx[1][j]], RANGES[rb[1] + j][0], RANGES[rb[1] + j][1]); rec[w] = v & 255; rec[w + 1] = (v >> 8) & 255; w += 2; }
-    for (let j = 0; j < 4; j++) rec[w++] = Math.max(0, Math.min(255, Math.round((f[o + idx[2][j]] + 1) * 127.5)));
-    rec[w++] = u8e(f[o + idx[3][0]], RANGES[rb[3]][0], RANGES[rb[3]][1]);
-    for (let j = 0; j < 3; j++) rec[w++] = u8e(f[o + idx[4][j]], RANGES[rb[4] + j][0], RANGES[rb[4] + j][1]);
-    if (GROUPS.length > 5) for (let j = 0; j < restSrc.length; j++) rec[w++] = u8e(f[o + idx[5][j]], RANGES[rb[5] + j][0], RANGES[rb[5] + j][1]);
+    for (let gi = 0; gi < GROUPS.length; gi++) {
+      const g = GROUPS[gi];
+      if (g.type === 'q8') {
+        for (let j = 0; j < 4; j++) rec[w++] = Math.max(0, Math.min(255, Math.round((f[o + idx[gi][j]] + 1) * 127.5)));
+        continue;
+      }
+      const enc = ENC[g.type], nb = BYTES[g.type];
+      for (let j = 0; j < g.props.length; j++) {
+        const v = enc(f[o + idx[gi][j]], RANGES[rb[gi] + j][0], RANGES[rb[gi] + j][1]);
+        for (let b = 0; b < nb; b++) rec[w++] = (v >> (8 * b)) & 255;
+      }
+    }
   }
 
   /* 重新生成表头：只保留用到的属性，f_rest 连续编号 */
+  const outDegree = restSrc.length ? degree : 0;
   const comments = P.header.split('\n').filter((l) => l.startsWith('comment'))
-    .map((l) => (/SH degree/.test(l) ? 'comment SH degree: ' + degree : l));
+    .map((l) => (/SH degree/.test(l) ? 'comment SH degree: ' + outDegree : l));
   const orderedProps = ['f_dc_0', 'f_dc_1', 'f_dc_2']
-    .concat(GROUPS.length > 5 ? restOut : [])
+    .concat(restOut)
     .concat(['opacity', 'rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'x', 'y', 'z']);
   const header = ['ply', 'format binary_little_endian 1.0']
     .concat(comments)
@@ -163,5 +267,5 @@ export function buildPayload(plyBuf, { degree = 2 } = {}) {
   const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32LE(metaBuf.length, 0);
   const cntBuf = Buffer.alloc(4); cntBuf.writeUInt32LE(RANGES.length, 0);
   const payload = Buffer.concat([lenBuf, metaBuf, cntBuf, rangeBuf, rec]);
-  return { payload, REC, count, degree, restCount: restSrc.length, props: orderedProps };
+  return { payload, REC, count, degree: outDegree, restCount: restSrc.length, props: orderedProps, profile, srcCount: P.count };
 }
