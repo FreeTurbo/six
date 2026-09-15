@@ -4,12 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
   <meta name="color-scheme" content="dark">
+  <!-- 老式写法，部分国产浏览器（vivo/QQ 等）靠它判断页面已是深色，
+       从而不再套用「强制深色 / 夜间模式」滤镜（那会把整页含画布一起反色）。 -->
+  <meta name="supported-color-schemes" content="dark">
   <meta name="description" content="基于 three.js 与 Spark 的高斯泼溅（3D Gaussian Splatting）模型在线展示">
-  <meta name="theme-color" content="#06080c">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>高斯泼溅模型展示</title>
 
   <!-- 内联 SVG 图标：省一次请求，也避免 404 -->
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%234ade80' opacity='.22'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%234ade80'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230A84FF' opacity='.25'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%230A84FF'/%3E%3C/svg%3E">
 
   <!--
     裸说明符 → assets 下的本地文件。
@@ -32,37 +37,58 @@
 <body>
   <!-- 3D 画布挂载点 -->
   <div id="stage"></div>
-  <!-- 画布上方的氛围层：极淡冷色辉光 + 四周压暗，给玻璃面板提供“可透视的背景” -->
+  <!-- 画布上方的氛围层：极淡冷色辉光 + 四周压暗。
+       ⚠ 这里不要用 mix-blend-mode（曾导致部分安卓机整屏偏色），只用普通叠加。 -->
   <div id="glow"></div>
   <div id="vignette"></div>
 
-  <!-- 标题：模型名与点数由 app.js 填充 -->
-  <header id="hud" class="glass">
-    <h1>高斯泼溅模型<span class="dot"></span></h1>
-    <p class="sub"><span class="tag">3D Gaussian Splatting · </span><span id="count">加载中…</span></p>
-  </header>
+  <!-- 顶栏：标题 + 模型列表（切换模型时按需下载，不在启动时全部加载） -->
+  <div id="topbar">
+    <header id="hud" class="glass">
+      <h1>高斯泼溅模型<span class="dot"></span></h1>
+      <p class="sub"><span class="tag">3D Gaussian Splatting · </span><span id="count">加载中…</span></p>
+    </header>
 
-  <!-- 模型切换列表：只在模型数 > 1 时显示（见 app.js 的 [2.10]） -->
-  <aside id="models" class="glass" hidden>
-    <div class="mtitle">模型列表</div>
-    <div id="mlist"></div>
-  </aside>
+    <aside id="models" class="glass">
+      <div class="mtitle">模型</div>
+      <div id="mlist" role="listbox" aria-label="模型列表"></div>
+    </aside>
+  </div>
 
   <!-- 工具栏 -->
-  <nav id="toolbar" class="glass">
-    <button id="btn-reset" type="button" title="回到初始视角（快捷键 R）">重置视角</button>
-    <button id="btn-auto" type="button" aria-pressed="false" title="自动旋转（快捷键 空格）">自动旋转</button>
-    <button id="btn-clean" type="button" aria-pressed="false" title="滤除把画面糊成白雾的超大低透明度高斯">去雾</button>
-    <button id="btn-full" type="button" title="全屏（快捷键 F）">全屏</button>
+  <nav id="toolbar" class="glass" aria-label="视图控制">
+    <button id="btn-reset" type="button" aria-label="重置视角">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg>
+      <span>重置</span>
+    </button>
+    <button id="btn-auto" type="button" aria-pressed="false" aria-label="自动旋转">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a8 8 0 1 0 7.4 5H17a6 6 0 1 1-5-3v2l4-3-4-3v2z"/></svg>
+      <span>旋转</span>
+    </button>
+    <button id="btn-clean" type="button" aria-pressed="false" aria-label="去雾">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21c-4 0-7-3.6-7-8 0-3 2-5.5 4.5-6.8L12 3l2.5 3.2C17 7.5 19 10 19 13c0 4.4-3 8-7 8zm0-2c2.8 0 5-2.7 5-6 0-2.1-1.4-4-3.4-5.1L12 6.5l-1.6 1.3C8.4 8.9 7 10.9 7 13c0 3.3 2.2 6 5 6z"/></svg>
+      <span>去雾</span>
+    </button>
+    <button id="btn-compat" type="button" aria-pressed="false" aria-label="兼容模式">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l8 4v6c0 5-3.4 8.8-8 10-4.6-1.2-8-5-8-10V6l8-4zm0 2.2L6 7v5c0 3.9 2.5 6.9 6 7.9 3.5-1 6-4 6-7.9V7l-6-2.8zM11 8h2v5h-2V8zm0 6.5h2V17h-2v-2.5z"/></svg>
+      <span>兼容</span>
+    </button>
+    <button id="btn-full" type="button" aria-label="全屏">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm14 0h2v5h-5v-2h3v-3z"/></svg>
+      <span>全屏</span>
+    </button>
   </nav>
 
   <!-- 操作提示：文案由 app.js 按触屏/鼠标自动切换 -->
   <div id="hint">左键拖拽旋转 · 滚轮缩放 · 中键或 Shift+左键平移 · 空格自动旋转</div>
 
+  <!-- 轻量提示条（兼容模式自动开启、切换失败等） -->
+  <div id="toast" role="status" aria-live="polite"></div>
+
   <!-- 加载遮罩 -->
   <div id="loading">
     <div class="loadcard glass">
-      <div class="ring"></div>
+      <div class="spinner"></div>
       <div class="ltitle">正在加载模型</div>
       <div class="track"><div id="bar"></div></div>
       <div id="status">准备中…</div>

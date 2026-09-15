@@ -7,19 +7,18 @@
  *   裸说明符由 index.html 里的 importmap 映射，不要改成 CDN，否则离线/内网不可用。
  *
  * 数据流：
- *   assets/model.json  模型清单（名称 / 点数 / 取景范围 / 朝向 / 默认视角）
- *        ↓
- *   assets/model.bin   deflate(量化载荷)  ——  格式见 tools/pack.mjs 头部注释
- *        ↓  fetch → DecompressionStream('deflate')
+ *   assets/model.json   模型清单（名称 / 点数 / 取景范围 / 朝向 / 默认视角）
+ *        ↓                ★ 启动时只读这个（几 KB），模型数据按需下载
+ *   assets/model.bin    deflate(量化载荷)  ——  格式见 tools/pack.mjs 头部注释
+ *        ↓  fetch（带进度）→ DecompressionStream('deflate')
  *   量化载荷 → unpackPly() → 标准 3DGS PLY 的字节流（Float32 布局）
  *        ↓  new SplatMesh({ fileBytes })
  *   Spark 解析 → GPU 上的高斯 → 每帧由 SparkRenderer 排序渲染
  *
- * 主要模块：
- *   [1] 工具函数        解压 / 解码 / 去雾 / DOM
- *   [2] 场景与相机      自由轨道旋转（无角度限制）+ 缩放 + 平移
- *   [3] 模型管理        按需加载、缓存、切换（当前只有 1 个模型，列表会自动隐藏）
- *   [4] 界面联动        按钮、加载进度、错误提示、玻璃高光跟随
+ * 模块索引：
+ *   [1] 工具函数        错误/提示 / 解压 / 解码 / 去雾 / 兼容降级
+ *   [2] 主流程          环境自检 → 清单 → 渲染器 → 相机 → 模型 → 输入 → 界面 → 循环
+ *   [3] 兼容性与画质    色彩空间显式声明、像素比上限、首帧色彩自检 + 自动降级
  * ============================================================================
  */
 
@@ -32,15 +31,19 @@ import { SparkRenderer, SplatMesh } from '@sparkjsdev/spark';
 
 const CONFIG_URL = './assets/model.json';
 
-/** 去雾阈值：尺度（对数域）超过它的低透明度高斯会被判为「雾」。
- *  exp(-1.6) ≈ 0.2 个世界单位——在这个模型里相当于 20cm 以上的半透明大团，
- *  实测正是它们把整个画面糊成白雾。想调松紧改这一个数即可。 */
+/** 去雾阈值：尺度（对数域）超过它的低透明度高斯会被判为「雾」。exp(-1.6) ≈ 0.2 世界单位。
+ *  本项目模型有约 3.3% 这样的点，叠加后会把画面糊成白雾。想调松紧改这一个数即可。 */
 const HAZE_LOG_SCALE = -1.6;
 
+/** 首帧色彩自检：高饱和像素占比超过该值就认为渲染异常，自动切到兼容模式。 */
+const SATURATION_ALERT = 0.30;
+/** 兼容模式偏好的持久化键（用户手动切换过就记住） */
+const COMPAT_KEY = 'splat-viewer.compat';
+
 /** 交互灵敏度 */
-const ROTATE_SPEED = 0.005;   // 弧度 / 像素
-const ZOOM_SPEED = 0.0012;    // 每 wheel delta 的指数系数
-const AUTO_ROTATE_SPEED = 0.0025; // 弧度 / 帧
+const ROTATE_SPEED = 0.005;        // 弧度 / 像素
+const ZOOM_SPEED = 0.0012;         // 每 wheel delta 的指数系数
+const AUTO_ROTATE_SPEED = 0.0025;  // 弧度 / 帧
 
 const $ = (id) => document.getElementById(id);
 
@@ -49,11 +52,10 @@ const $ = (id) => document.getElementById(id);
  * ========================================================================== */
 
 let fatal = false;
-/** 统一的致命错误出口：显示可读的错误面板 + 写入标题（方便自动化测试读取） */
+/** 统一的致命错误出口：显示可读的错误面板（而不是白屏） */
 function fatalError(title, detail, hint) {
   if (fatal) return;
   fatal = true;
-  document.title = 'ERR ' + title;
   $('errorTitle').textContent = title;
   $('errorDetail').innerHTML = detail || '';
   $('errorHint').innerHTML = hint || '';
@@ -61,7 +63,17 @@ function fatalError(title, detail, hint) {
   $('loading').classList.add('hide');
   console.error('[viewer]', title, detail);
 }
-/** 非致命提示：写到加载卡的状态行 */
+
+/** 轻量提示条 */
+let toastTimer = 0;
+function showToast(msg, ms = 4200) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), ms);
+}
+
 const setStatus = (text, pct) => {
   $('status').textContent = text;
   if (pct != null) $('bar').style.width = (Math.max(0, Math.min(1, pct)) * 100).toFixed(1) + '%';
@@ -69,10 +81,7 @@ const setStatus = (text, pct) => {
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * 下载 + 解压 assets/*.bin
- * 用流式读取以便显示下载进度（模型 9.7MB，进度条很有必要）。
- */
+/** 下载 + deflate 解压 assets/*.bin（带进度回调） */
 async function fetchDeflated(url, onProgress) {
   const res = await fetch(url, { cache: 'force-cache' });
   if (!res.ok) throw new Error('模型数据下载失败：HTTP ' + res.status + ' ' + res.statusText);
@@ -105,7 +114,7 @@ async function fetchDeflated(url, onProgress) {
 
 /**
  * unpackPly —— 量化载荷 → 标准 3DGS PLY 字节流
- * 载荷格式见 tools/pack.mjs 头部注释；写入顺序必须与 pack.mjs 的 GROUPS 完全一致。
+ * 载荷格式见 tools/pack.mjs 头部注释；读取顺序必须与 pack.mjs 的 GROUPS 完全一致。
  */
 function unpackPly(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -119,9 +128,7 @@ function unpackPly(buf) {
 
   const { props, count } = meta;
   const stride = props.length;
-
-  /* 属性名 → 在该点记录中的 float 下标 */
-  const off = {};
+  const off = {};                                   // 属性名 → 该点记录内的 float 下标
   for (let i = 0; i < stride; i++) off[props[i]] = i;
 
   const headerBytes = new TextEncoder().encode(meta.header);
@@ -160,7 +167,7 @@ function unpackPly(buf) {
     }
   }
 
-  /* 旋转重新归一化（8bit 量化后模长会偏离 1，不归一化会导致高斯被拉长） */
+  /* 旋转重新归一化（8bit 量化后模长会偏离 1，不归一化高斯会被拉长） */
   const ro = off['rot_0'];
   for (let k = 0; k < count; k++) {
     const b = k * stride + ro;
@@ -175,7 +182,7 @@ function unpackPly(buf) {
   return out;
 }
 
-/* --------------------------------------------------------------- 去雾过滤 */
+/* ------------------------------------------------------- PLY 表头解析 */
 const TYPE_SIZE = { float: 4, float32: 4, double: 8, uchar: 1, uint8: 1, char: 1, int8: 1, int: 4, int32: 4, uint: 4, uint32: 4, short: 2, int16: 2, ushort: 2, uint16: 2 };
 
 /** 解析 PLY 文本头，得到属性名与字节偏移（按 header 里的声明顺序） */
@@ -201,8 +208,28 @@ function plyLayout(u8) {
 }
 
 /**
- * 去掉「超大低透明度高斯」——它们叠在一起会把画面糊成白雾。
- * 判据：三个轴的对数尺度最大值 > maxLogScale。返回 { bytes, count, total }。
+ * 兼容模式：把球谐系数（f_rest_*）全部清零，等价于「只用 DC 颜色」。
+ * 为什么需要：球谐承载视角相关颜色，要在着色器里按视线方向求值，
+ * 对 GPU 的浮点精度/纹理路径更敏感；个别安卓机型会把这一项算花，
+ * 表现为整屏彩虹色（几何却是对的）。清零后退化成最稳的逐点固定颜色。
+ */
+function stripSh(u8) {
+  const L = plyLayout(u8);
+  if (!L) return null;
+  const restOff = L.props.filter((p) => /^f_rest_\d+$/.test(p.name)).map((p) => L.offsets[p.name]);
+  if (!restOff.length) return null;
+  const copy = u8.slice();
+  const dv = new DataView(copy.buffer, copy.byteOffset, copy.byteLength);
+  for (let k = 0; k < L.count; k++) {
+    const base = L.dataStart + k * L.stride;
+    for (let j = 0; j < restOff.length; j++) dv.setFloat32(base + restOff[j], 0, true);
+  }
+  return copy;
+}
+
+/**
+ * 去雾：丢掉「超大低透明度」高斯（三轴对数尺度最大值 > maxLogScale）。
+ * 返回 { bytes, count, total }。
  */
 function filterHaze(u8, maxLogScale) {
   const L = plyLayout(u8);
@@ -235,17 +262,19 @@ function filterHaze(u8, maxLogScale) {
  * ========================================================================== */
 
 const app = {
-  models: [],        // 来自 model.json
-  state: [],         // 每个模型的运行期状态
+  models: [],          // 来自 model.json
+  state: [],           // 每个模型的运行期状态（懒加载：未切换到的模型保持为空）
   current: -1,
-  cleanMode: false,  // 去雾开关（全局，切换模型时重置）
+  compat: false,       // 兼容模式（关闭球谐）
+  cleanMode: false,    // 去雾开关
   busy: false,
   autoRotate: false,
-  hintHidden: false
+  hintHidden: false,
+  checked: false       // 是否已做过首帧色彩自检
 };
 
 async function main() {
-  /* ---------------------------------------------------------- 环境自检 */
+  /* ------------------------------------------------------ [2.1] 环境自检 */
   if (location.protocol === 'file:') {
     /* 正常情况下这段不会执行到：file:// 下模块脚本已被浏览器拦下，
        提示由 index.html 里的内联脚本给出。这里兜底 Firefox 等
@@ -254,7 +283,7 @@ async function main() {
     return;
   }
 
-  /* ------------------------------------------------------ [2.1] 模型清单 */
+  /* ------------------------------------------------------ [2.2] 模型清单 */
   let cfg;
   try {
     const res = await fetch(CONFIG_URL, { cache: 'no-cache' });
@@ -267,27 +296,41 @@ async function main() {
     return;
   }
   app.models = (cfg.models || []).filter((m) => m && m.file);
-  app.state = app.models.map(() => ({ mesh: null, bytes: null, clean: null, cleanCount: 0 }));
+  app.state = app.models.map(() => ({ mesh: null, bytes: null, bytesNoSh: null, clean: null, cleanCount: 0 }));
   if (!app.models.length) {
     fatalError('模型清单是空的', '<code>assets/model.json</code> 里没有任何模型条目。',
       '用 <code>node tools/build.mjs 你的模型.ply</code> 生成一个。');
     return;
   }
+  app.compat = readCompatPref();
 
-  /* -------------------------------------------------------- [2.2] 场景 */
-  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  /* --------------------------------------------- [2.3] 渲染器与色彩空间 */
+  const renderer = new THREE.WebGLRenderer({
+    antialias: false,
+    alpha: false,
+    /* 不用 high-performance：部分安卓会因此走到有问题的驱动路径 */
+    powerPreference: 'default',
+    preserveDrawingBuffer: false,
+    stencil: false
+  });
+  renderer.setPixelRatio(pickPixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setClearColor(0x06080c, 1);
+  renderer.setClearColor(0x000000, 1);
+  /* 显式声明色彩空间：个别设备/浏览器对画布的色彩空间处理不一致，
+     会导致整屏偏色（把原本的雾状高斯放大成彩虹）。这里固定为 sRGB。 */
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  const gl = renderer.getContext();
+  try { if ('drawingBufferColorSpace' in gl) gl.drawingBufferColorSpace = 'srgb'; } catch (e) { /* 老浏览器忽略 */ }
+  try { if ('unpackColorSpace' in gl) gl.unpackColorSpace = 'srgb'; } catch (e) { /* 老浏览器忽略 */ }
+  logGpuInfo(gl);
   $('stage').appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 3000);
-
   const spark = new SparkRenderer({ renderer });
   scene.add(spark);
 
-  /* ------------------------------------------------------ [2.3] 相机 */
+  /* ------------------------------------------------------ [2.4] 相机 */
   /* 用「偏移向量 + 上方向」而不是欧拉角，这样可以无限制地自由旋转
      （球坐标的 phi 会被卡在天顶/天底，翻过头顶还会突然跳变）。 */
   const cam = {
@@ -340,8 +383,8 @@ async function main() {
     applyCamera();
   }
 
-  /* ------------------------------------------------- [2.4] 模型加载 */
-  /** 取景 + 应用朝向修正；每次切换模型都会调用 */
+  /* ------------------------------------------------- [2.5] 模型管理 */
+  /** 取景 + 应用朝向修正 */
   function frameModel(i) {
     const m = app.models[i];
     const sz = m.frame.size;
@@ -352,7 +395,6 @@ async function main() {
     const rad = Math.max(sz[0], sz[1], sz[2]) * 0.5 || 1;
     const vFov = (camera.fov * Math.PI) / 180;
     const hFov = 2 * Math.atan(Math.tan(vFov / 2) * Math.max(0.6, camera.aspect));
-    /* 按视口宽高比取景：纵向、横向各算一次，取更远的那个，再加一点进深余量 */
     const fit = Math.max((sz[1] / 2) / Math.tan(vFov / 2), (sz[0] / 2) / Math.tan(hFov / 2)) * 1.06 + sz[2] * 0.25;
 
     cam.minRadius = rad * 0.02;
@@ -376,41 +418,29 @@ async function main() {
     const m = app.models[app.current];
     const st = app.state[app.current];
     const n = (app.cleanMode && st.clean) ? st.cleanCount : m.count;
-    $('count').textContent = (app.models.length > 1 ? m.name + ' · ' : '') +
-      n.toLocaleString('en-US') + ' 个高斯点' + ((app.cleanMode && st.clean) ? '（已滤除雾状点）' : '');
+    $('count').textContent = n.toLocaleString('en-US') + ' 个高斯点' +
+      ((app.cleanMode && st.clean) ? ' · 已去雾' : '') + (app.compat ? ' · 兼容模式' : '');
     const rows = $('mlist').children;
     for (let i = 0; i < rows.length; i++) rows[i].classList.toggle('on', i === app.current);
   }
 
-  /** 确保第 i 个模型已加载（含解压、解码、上传 GPU） */
-  async function ensureMesh(i) {
+  /** 用指定字节流为第 i 个模型构建（或重建）SplatMesh */
+  async function buildMesh(i, bytes) {
     const st = app.state[i];
-    if (st.mesh) return;
     const m = app.models[i];
-
-    setStatus('正在下载模型数据…', 0.02);
-    await nextFrame();
-    const payload = await fetchDeflated(m.file, (p) => setStatus('正在下载模型数据…', 0.02 + p * 0.5));
-    await nextFrame();
-
-    setStatus('正在解码…', 0.55);
-    await nextFrame();
-    st.bytes = unpackPly(payload);
-
-    setStatus('正在构建高斯…', 0.75);
-    await nextFrame();
-    const mesh = new SplatMesh({ fileBytes: st.bytes, fileName: m.name + '.ply' });
-    /* 朝向修正：绕 X 轴 180°（Brush 导出的 PLY 在 Spark 里默认上下颠倒） */
+    if (st.mesh) {
+      scene.remove(st.mesh);
+      try { st.mesh.dispose(); } catch (e) { /* 忽略 */ }
+      st.mesh = null;
+    }
+    const mesh = new SplatMesh({ fileBytes: bytes, fileName: m.name + '.ply' });
+    /* 朝向修正：绕 X 轴 180°（Brush 导出的 PLY 在 Spark 里默认上下颠倒，见 README 6.2） */
     if (m.flipX) mesh.quaternion.set(1, 0, 0, 0);
     scene.add(mesh);
     st.mesh = mesh;
 
     if (mesh.initialized && typeof mesh.initialized.then === 'function') {
-      try {
-        await mesh.initialized;
-      } catch (e) {
-        throw new Error('高斯点云解析失败：' + ((e && e.message) || e));
-      }
+      try { await mesh.initialized; } catch (e) { throw new Error('高斯点云解析失败：' + ((e && e.message) || e)); }
     } else {
       await wait(2500);
     }
@@ -421,41 +451,141 @@ async function main() {
     if (!got) throw new Error('高斯点云解析失败：结果为 0 个点（检查 PLY 表头与 f_rest 编号是否连续）');
   }
 
+  /** 按需下载 + 解码 + 构建第 i 个模型（未切换到的模型不会被加载） */
+  async function ensureMesh(i) {
+    const st = app.state[i];
+    const m = app.models[i];
+
+    if (!st.bytes) {
+      setStatus('正在下载模型数据…', 0.02);
+      const payload = await fetchDeflated(m.file, (p) => setStatus('正在下载模型数据…', 0.02 + p * 0.5));
+      setStatus('正在解码…', 0.55);
+      await nextFrame();
+      st.bytes = unpackPly(payload);
+    }
+    setStatus('正在构建高斯…', 0.75);
+    await nextFrame();
+    const source = app.compat ? (st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes))) : st.bytes;
+    await buildMesh(i, source);
+    /* 兼容模式切换后，去雾副本要重建 */
+    if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; }
+  }
+
   /** 切换 / 首次加载模型 */
   async function selectModel(i, first) {
-    if (app.busy || (i === app.current && !first)) return;
+    if (app.busy || (i === app.current && !first) || !app.models[i]) return;
     app.busy = true;
     const needLoad = !app.state[i].mesh;
-    if (needLoad) showLoading();
+    const row = $('mlist').children[i];
+    if (needLoad) { showLoading('正在加载「' + app.models[i].name + '」'); row && row.classList.add('busy'); }
     try {
       await ensureMesh(i);
       app.current = i;
       frameModel(i);
-      if (!first) app.cleanMode = false;   // 切换模型时关闭去雾，避免误判「变清楚了」
-      syncCleanButton();
+      if (!first) app.cleanMode = false;
+      syncButtons();
       applyVisibility();
       updateHud();
-      document.title = 'OK ' + app.models[i].count + ' splats';
+      document.title = app.models[i].name + ' · 高斯泼溅模型展示';
+      if (needLoad && !app.checked) { app.checked = true; await firstFrameCheck(); }
     } catch (e) {
       fatalError('模型加载失败', (e && e.message) || String(e),
         '检查 <code>assets/model.bin</code> 是否完整、是否与 <code>model.json</code> 配套。');
     }
+    row && row.classList.remove('busy');
     app.busy = false;
     if (needLoad) hideLoading();
   }
 
-  /** 去雾开关：懒加载 —— 第一次点开才生成过滤后的副本 */
-  async function setClean(on, logScale) {
+  /**
+   * [3] 首帧色彩自检 —— 个别机型会把球谐算花（几何正常、颜色变成彩虹）。
+   * 做法：渲染一帧后抽样读回画布像素，统计「高饱和像素占比」；
+   *       若明显异常，就清空球谐重建（兼容模式），并记住这个偏好。
+   */
+  async function firstFrameCheck() {
+    if (location.hash.indexOf('nocheck') >= 0) return;
+    if (!app.compat) {
+      const s = measureSaturation();
+      if (s != null && s > SATURATION_ALERT) {
+        console.warn('[viewer] 首帧色彩异常（高饱和像素 ' + (s * 100).toFixed(1) + '%），切换到兼容模式');
+        app.compat = true;
+        writeCompatPref(true);
+        const st = app.state[app.current];
+        await buildMesh(app.current, st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes)));
+        syncButtons(); updateHud();
+        const s2 = measureSaturation();
+        showToast('检测到显卡渲染异常，已自动开启「兼容模式」' + (s2 != null ? '（异常像素 ' + (s * 100).toFixed(0) + '% → ' + (s2 * 100).toFixed(0) + '%）' : ''));
+      }
+    }
+  }
+
+  /** 抽样读取画布像素，返回高饱和像素占比（0~1）；读取失败返回 null */
+  function measureSaturation() {
+    try {
+      renderer.render(scene, camera);          // 保证当前帧已绘制
+      const W = renderer.domElement.width, H = renderer.domElement.height;
+      const tile = 32;
+      const px = new Uint8Array(tile * tile * 4);
+      const pts = [[0.2, 0.2], [0.5, 0.2], [0.8, 0.2], [0.2, 0.5], [0.5, 0.5], [0.8, 0.5], [0.2, 0.8], [0.5, 0.8], [0.8, 0.8]];
+      let sat = 0, n = 0;
+      for (const [fx, fy] of pts) {
+        const x = Math.max(0, Math.min(W - tile, Math.round(W * fx - tile / 2)));
+        const y = Math.max(0, Math.min(H - tile, Math.round(H * fy - tile / 2)));
+        gl.readPixels(x, y, tile, tile, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        for (let i = 0; i < tile * tile; i++) {
+          const o = i * 4;
+          const mx = Math.max(px[o], px[o + 1], px[o + 2]);
+          const mn = Math.min(px[o], px[o + 1], px[o + 2]);
+          if (mx > 40 && mx - mn > 90) sat++;
+          n++;
+        }
+      }
+      return n ? sat / n : null;
+    } catch (e) {
+      console.warn('[viewer] 色彩自检失败：', e);
+      return null;
+    }
+  }
+
+  /** 兼容模式开关（手动） */
+  async function setCompat(on, silent) {
+    if (app.busy || app.current < 0 || app.compat === on) { syncButtons(); return; }
+    app.busy = true;
+    const st = app.state[app.current];
+    if (on) {
+      if (!st.bytesNoSh) {
+        setStatus('正在生成兼容版本…', 0.6);
+        showLoading('正在生成兼容版本');
+        syncButtons(); updateHud();
+        await nextFrame();
+        st.bytesNoSh = stripSh(st.bytes);
+      }
+      app.compat = true;
+      try { await buildMesh(app.current, st.bytesNoSh); } catch (e) { fatalError('兼容模式构建失败', (e && e.message) || String(e)); }
+      hideLoading();
+    } else {
+      app.compat = false;
+      try { await buildMesh(app.current, st.bytes); } catch (e) { fatalError('恢复失败', (e && e.message) || String(e)); }
+      st.bytesNoSh = null;                 // 释放副本
+    }
+    writeCompatPref(app.compat);
+    if (st.clean) { scene.remove(st.clean); try { st.clean.dispose(); } catch (e) { } st.clean = null; app.cleanMode = false; }
+    syncButtons(); applyVisibility(); updateHud();
+    app.busy = false;
+    if (!silent) showToast(app.compat ? '已开启兼容模式：关闭视角相关颜色，画面更稳但略平' : '已关闭兼容模式');
+  }
+
+  /** 去雾开关：懒生成过滤后的副本 */
+  async function setClean(on) {
     if (app.busy || app.current < 0) return;
-    const i = app.current;
-    const st = app.state[i];
-    const btn = $('btn-clean');
+    const i = app.current, st = app.state[i];
     if (on && !st.clean && st.bytes) {
       app.busy = true;
+      const btn = $('btn-clean');
       btn.classList.add('busy');
-      btn.textContent = '处理中…';
       await nextFrame();
-      const res = filterHaze(st.bytes, logScale == null ? HAZE_LOG_SCALE : logScale);
+      const base = app.compat ? (st.bytesNoSh || (st.bytesNoSh = stripSh(st.bytes))) : st.bytes;
+      const res = filterHaze(base, HAZE_LOG_SCALE);
       if (res) {
         st.cleanCount = res.count;
         const mesh = new SplatMesh({ fileBytes: res.bytes, fileName: 'clean.ply' });
@@ -470,22 +600,22 @@ async function main() {
       app.busy = false;
     }
     app.cleanMode = !!on && !!st.clean;
-    syncCleanButton();
-    applyVisibility();
-    updateHud();
-  }
-  function syncCleanButton() {
-    const btn = $('btn-clean');
-    btn.classList.toggle('on', app.cleanMode);
-    btn.textContent = app.cleanMode ? '去雾' : '去雾';
-    btn.setAttribute('aria-pressed', app.cleanMode ? 'true' : 'false');
+    syncButtons(); applyVisibility(); updateHud();
   }
 
-  /* --------------------------------------------------- [2.5] 加载遮罩 */
-  function showLoading() {
+  function syncButtons() {
+    $('btn-clean').classList.toggle('on', app.cleanMode);
+    $('btn-clean').setAttribute('aria-pressed', app.cleanMode ? 'true' : 'false');
+    $('btn-compat').classList.toggle('on', app.compat);
+    $('btn-compat').setAttribute('aria-pressed', app.compat ? 'true' : 'false');
+    $('btn-auto').classList.toggle('on', app.autoRotate);
+  }
+
+  /* --------------------------------------------------- [2.6] 加载遮罩 */
+  function showLoading(text) {
     const el = $('loading');
     el.style.display = 'flex';
-    setStatus('正在准备…', 0.01);
+    setStatus(text || '正在准备…', 0.01);
     requestAnimationFrame(() => el.classList.remove('hide'));
   }
   function hideLoading() {
@@ -494,7 +624,7 @@ async function main() {
     setTimeout(() => { el.style.display = 'none'; }, 700);
   }
 
-  /* ------------------------------------------------------ [2.6] 输入 */
+  /* ------------------------------------------------------ [2.7] 输入 */
   const el = renderer.domElement;
   const pointers = new Map();
   let dragging = false;
@@ -563,8 +693,7 @@ async function main() {
     zoomBy(Math.exp(e.deltaY * ZOOM_SPEED));
   }, { passive: false });
 
-  /* 双击复位（触屏用户没有 R 键） */
-  el.addEventListener('dblclick', () => resetView());
+  el.addEventListener('dblclick', () => resetView());   // 触屏用户没有 R 键
 
   function resetView() {
     cam.offset.copy(HOME_OFFSET);
@@ -577,14 +706,14 @@ async function main() {
     $('hint').classList.add('fade');
   }
 
-  /* ------------------------------------------------------- [2.7] 界面 */
+  /* ------------------------------------------------------- [2.8] 界面 */
   $('btn-reset').addEventListener('click', resetView);
   $('btn-auto').addEventListener('click', () => {
     app.autoRotate = !app.autoRotate;
-    $('btn-auto').classList.toggle('on', app.autoRotate);
-    $('btn-auto').setAttribute('aria-pressed', app.autoRotate ? 'true' : 'false');
+    syncButtons();
   });
   $('btn-clean').addEventListener('click', () => setClean(!app.cleanMode));
+  $('btn-compat').addEventListener('click', () => setCompat(!app.compat));
   $('btn-full').addEventListener('click', () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
@@ -605,10 +734,11 @@ async function main() {
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
+    renderer.setPixelRatio(pickPixelRatio());
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  /* ------------------------------------------- [2.8] 玻璃高光跟随指针 */
+  /* ------------------------------------------- [2.9] 玻璃高光跟随指针 */
   document.querySelectorAll('.glass').forEach((panel) => {
     panel.addEventListener('pointermove', (e) => {
       const r = panel.getBoundingClientRect();
@@ -621,7 +751,7 @@ async function main() {
     });
   });
 
-  /* --------------------------------------------------- [2.9] 渲染循环 */
+  /* --------------------------------------------------- [2.10] 渲染循环 */
   renderer.setAnimationLoop(() => {
     if (app.autoRotate && !dragging) {
       _q.setFromAxisAngle(cam.up, AUTO_ROTATE_SPEED);
@@ -629,35 +759,35 @@ async function main() {
       applyCamera();
     }
     renderer.render(scene, camera);
-    if (!app.hintHidden && performance.now() > 8000) hideHint();
+    if (!app.hintHidden && performance.now() > 9000) hideHint();
   });
 
-  /* ------------------------------------------------ [2.10] 模型列表 UI */
-  if (app.models.length > 1) {
-    $('models').hidden = false;
-    app.models.forEach((m, i) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'mrow';
-      const dot = document.createElement('span'); dot.className = 'mdot';
-      const box = document.createElement('span'); box.className = 'mtext';
-      const nm = document.createElement('span'); nm.className = 'mname'; nm.textContent = m.name;
-      const mt = document.createElement('span'); mt.className = 'mmeta';
-      mt.textContent = m.count.toLocaleString('en-US') + ' 点';
-      box.append(nm, mt);
-      b.append(dot, box);
-      b.addEventListener('click', () => selectModel(i));
-      $('mlist').appendChild(b);
-    });
-  }
+  /* ------------------------------------------------ [2.11] 模型列表 UI */
+  /* 列表按 model.json 生成；模型数据不在启动时下载，点哪一行才加载哪一行。 */
+  app.models.forEach((m, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mrow';
+    b.setAttribute('role', 'option');
+    b.title = m.name + '（' + m.count.toLocaleString('en-US') + ' 个高斯点）';
+    const dot = document.createElement('span'); dot.className = 'mdot';
+    const box = document.createElement('span'); box.className = 'mtext';
+    const nm = document.createElement('span'); nm.className = 'mname'; nm.textContent = m.name;
+    const mt = document.createElement('span'); mt.className = 'mmeta';
+    mt.textContent = m.count.toLocaleString('en-US') + ' 点';
+    box.append(nm, mt);
+    b.append(dot, box);
+    b.addEventListener('click', () => selectModel(i));
+    $('mlist').appendChild(b);
+  });
 
-  /* ------------------------------------------------ [2.11] 调试接口 */
-  /* 仅用于自动化测试与排障，正常使用不会用到；也方便交接时在控制台里排查 */
+  /* ------------------------------------------------ [2.12] 调试接口 */
+  /* 供自动化测试与排障使用（控制台里也能直接查状态） */
   window.__viewer = {
-    THREE, scene, camera, renderer, spark,
-    app, cam,
+    THREE, scene, camera, renderer, spark, app, cam,
     get splats() { return app.current >= 0 ? app.state[app.current].mesh : null; },
-    selectModel, setView, orbit, zoomBy, pan, applyCamera, frameModel, setClean, resetView,
+    selectModel, setView, orbit, zoomBy, pan, applyCamera, frameModel, setClean, setCompat, resetView,
+    measureSaturation, stripSh,
     numSplats() {
       const st = app.current >= 0 ? app.state[app.current] : null;
       if (!st || !st.mesh) return 0;
@@ -669,10 +799,45 @@ async function main() {
     }
   };
 
-  /* ------------------------------------------------------ [2.12] 起飞 */
+  /* ------------------------------------------------------ [2.13] 起飞 */
+  /* 只加载第一个模型，其余等用户切换时再下载 */
   await selectModel(0, true);
+  syncButtons();
   if (location.hash.indexOf('haze') >= 0) { try { await setClean(true); } catch (e) { } }
   if (location.hash.indexOf('autorotate') >= 0) $('btn-auto').click();
+}
+
+/* ==========================================================================
+ * [3] 设备相关的小工具
+ * ========================================================================== */
+
+/** 像素比上限：同时限制 DPR 与「总像素数」，避免中低端手机显存/填充率吃紧 */
+function pickPixelRatio() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = window.innerWidth, h = window.innerHeight;
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const maxPixels = coarse ? 2.2e6 : 5.0e6;
+  let r = Math.min(dpr, 2);
+  while (w * h * r * r > maxPixels && r > 0.75) r -= 0.1;
+  return Math.max(0.75, Math.round(r * 20) / 20);
+}
+
+/** 打印 GPU 与精度信息，方便交接时远程排障（用户截图控制台即可） */
+function logGpuInfo(gl) {
+  try {
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    const hp = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+    console.info('[viewer] GPU:', dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+      '| highp:', hp ? hp.precision : '?', '| 画布:', gl.drawingBufferWidth + 'x' + gl.drawingBufferHeight,
+      '| DPR:', window.devicePixelRatio, '| colorBufferFloat:', !!gl.getExtension('EXT_color_buffer_float'));
+  } catch (e) { /* 忽略 */ }
+}
+
+function readCompatPref() {
+  try { return localStorage.getItem(COMPAT_KEY) === '1'; } catch (e) { return false; }
+}
+function writeCompatPref(on) {
+  try { on ? localStorage.setItem(COMPAT_KEY, '1') : localStorage.removeItem(COMPAT_KEY); } catch (e) { /* 忽略 */ }
 }
 
 main().catch((e) => {
