@@ -435,13 +435,30 @@ async function main() {
   }
 
   /* ------------------------------------------------- [2.5] 模型管理 */
+  /**
+   * 模型朝向四元数（按模型缓存）。
+   * 优先用 model.json 里的 `orient`（xyzw 四元数，能表达任意朝向修正）；
+   * 没有就退回 `flipX`（绕 X 轴 180° —— Brush 导出的 PLY 在 Spark 里默认上下颠倒）。
+   * orient 的来历与计算方法见 README 6.2。
+   */
+  const _orientCache = [];
+  function modelQuat(i) {
+    if (!_orientCache[i]) {
+      const m = app.models[i];
+      const q = new THREE.Quaternion();
+      if (Array.isArray(m.orient) && m.orient.length === 4) q.fromArray(m.orient);
+      else if (m.flipX) q.set(1, 0, 0, 0);
+      _orientCache[i] = q;
+    }
+    return _orientCache[i];
+  }
+
   /** 取景 + 应用朝向修正 */
   function frameModel(i) {
     const m = app.models[i];
     const sz = m.frame.size;
-    /* flipX 是绕 X 轴 180°：中心点的 y/z 取反，包围盒尺寸不变 */
-    const c = m.flipX ? [m.frame.center[0], -m.frame.center[1], -m.frame.center[2]] : m.frame.center;
-    cam.target.set(c[0], c[1], c[2]);
+    /* 朝向修正会把整个模型转过去，取景中心要跟着转（纯旋转不改变包围盒尺寸） */
+    cam.target.set(m.frame.center[0], m.frame.center[1], m.frame.center[2]).applyQuaternion(modelQuat(i));
 
     const rad = Math.max(sz[0], sz[1], sz[2]) * 0.5 || 1;
     const vFov = (camera.fov * Math.PI) / 180;
@@ -523,7 +540,7 @@ async function main() {
     }
     const mesh = new SplatMesh({ fileBytes: bytes, fileName: m.name + '-' + tier + '.ply' });
     /* 朝向修正：绕 X 轴 180°（Brush 导出的 PLY 在 Spark 里默认上下颠倒，见 README 6.2） */
-    if (m.flipX) mesh.quaternion.set(1, 0, 0, 0);
+    mesh.quaternion.copy(modelQuat(i));
     /* 先隐藏：构建期间新旧两档会同时在场景里，避免叠加出重影 */
     mesh.visible = false;
     scene.add(mesh);
@@ -662,7 +679,7 @@ async function main() {
     try {
       const noSh = st.noSh.full || (st.noSh.full = stripSh(slot.bytes));
       probe = new SplatMesh({ fileBytes: noSh, fileName: app.models[i].name + '-probe.ply' });
-      if (app.models[i].flipX) probe.quaternion.set(1, 0, 0, 0);
+      probe.quaternion.copy(modelQuat(i));
       probe.visible = false;
       scene.add(probe);
       if (probe.initialized && typeof probe.initialized.then === 'function') await probe.initialized;
@@ -782,7 +799,7 @@ async function main() {
         st.cleanCount = res.count;
         st.cleanFrom = st.active;
         const mesh = new SplatMesh({ fileBytes: res.bytes, fileName: 'clean.ply' });
-        if (app.models[i].flipX) mesh.quaternion.set(1, 0, 0, 0);
+        mesh.quaternion.copy(modelQuat(i));
         scene.add(mesh);
         st.clean = mesh;
         if (mesh.initialized && typeof mesh.initialized.then === 'function') {
@@ -1055,4 +1072,5 @@ function writeCompatPref(on) {
 main().catch((e) => {
   fatalError('初始化失败', (e && e.stack) ? String(e.stack).split('\n').slice(0, 3).join('<br>') : String(e));
 });
+
 

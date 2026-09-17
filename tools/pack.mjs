@@ -71,6 +71,13 @@ export const PROFILES = {
     types: { pos: 'u24', scale: 'u16', rot: 'q8', opacity: 'u8', dc: 'u8', rest: 'u8' },
     range: { pos: 'full', scale: 'full', rot: null, opacity: 'full', dc: 'full', rest: 'robust' }
   },
+  compact: {
+    /* 点数特别多的大模型用这一档：位置 16bit、尺度 8bit，每个点比 full 省 9 字节。
+       位置用 0.05%~99.95% 分位，只截断极少数远处漂浮点，换来更高的有效精度。 */
+    label: '紧凑',
+    types: { pos: 'u16', scale: 'u8', rot: 'q8', opacity: 'u8', dc: 'u8', rest: 'u8' },
+    range: { pos: 'tight', scale: 'robust', rot: null, opacity: 'full', dc: 'full', rest: 'robust' }
+  },
   lite: {
     label: '预览',
     types: { pos: 'u16', scale: 'u8', rot: 'q8', opacity: 'u8', dc: 'u8', rest: null },

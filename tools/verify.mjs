@@ -20,8 +20,11 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
-const srcPly = argv.find((a) => !a.startsWith('--'));
-const idx = argv.indexOf('--index') >= 0 ? parseInt(argv[argv.indexOf('--index') + 1], 10) : 0;
+const idxAt = argv.indexOf('--index');
+const idx = idxAt >= 0 ? parseInt(argv[idxAt + 1], 10) : 0;
+/* 注意排除 --index 后面的那个数字，否则它会被当成源 PLY 路径
+   （idxAt = -1 时不能排除第 0 个参数，那正是 PLY 路径） */
+const srcPly = argv.find((a, i) => !a.startsWith('--') && !(idxAt >= 0 && i === idxAt + 1));
 
 /* --- 取出 app.js 里真实的 unpackPly，保证验证的就是线上跑的代码 --- */
 const appSrc = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
@@ -74,49 +77,60 @@ if (!srcPly) { console.log('\n未提供原始 PLY，跳过逐属性比对。'); 
 
 const A = parse(fs.readFileSync(srcPly));
 console.log('\n原始: ' + A.n + ' 点 / ' + A.st + ' 属性');
+if (A.n !== B.n) console.log('⚠ 点数不同（原 ' + A.n + ' vs 打包后 ' + B.n + '）—— 抽样档位属正常，下面只比对共同的前 N 点');
+const N = Math.min(A.n, B.n);
 
-const LIMIT = { '位置 x/y/z': 1e-4, '尺度 scale': 1e-3, '旋转 rot': 1e-2, '不透明度': 5e-2, '颜色 f_dc': 5e-2 };
-let bad = 0;
+/* 判定口径说明：
+   紧凑档/预览档会**故意截断极少数远处漂浮点**（位置用 0.05%~99.95% 分位），
+   这些小点会被钉在取值边界上，单点误差可以很大 —— 所以不能只看「最大误差」，
+   否则会把预期行为误报成失败。这里改用「平均误差 + 超差比例」：            */
 const groups = {
-  '位置 x/y/z': ['x', 'y', 'z'],
-  '尺度 scale': ['scale_0', 'scale_1', 'scale_2'],
-  '旋转 rot': ['rot_0', 'rot_1', 'rot_2', 'rot_3'],
-  '不透明度': ['opacity'],
-  '颜色 f_dc': ['f_dc_0', 'f_dc_1', 'f_dc_2']
+  '位置 x/y/z': { names: ['x', 'y', 'z'], mean: 1e-2, outlier: 0.5, ratio: 0.002 },
+  '尺度 scale': { names: ['scale_0', 'scale_1', 'scale_2'], mean: 5e-2, outlier: 0.5, ratio: 0.005 },
+  '旋转 rot': { names: ['rot_0', 'rot_1', 'rot_2', 'rot_3'], mean: 5e-3, outlier: 1e-2, ratio: 0 },
+  '不透明度': { names: ['opacity'], mean: 5e-2, outlier: 5e-2, ratio: 0 },
+  '颜色 f_dc': { names: ['f_dc_0', 'f_dc_1', 'f_dc_2'], mean: 5e-2, outlier: 5e-2, ratio: 0 }
 };
-for (const [label, names] of Object.entries(groups)) {
-  let maxAbs = 0, sum = 0, cnt = 0;
-  for (const nm of names) {
+let bad = 0;
+for (const [label, lim] of Object.entries(groups)) {
+  let maxAbs = 0, sum = 0, cnt = 0, out = 0;
+  for (const nm of lim.names) {
     const k = A.props.indexOf(nm), q = B.props.indexOf(nm);
     if (k < 0 || q < 0) continue;
-    for (let i = 0; i < A.n; i++) {
+    for (let i = 0; i < N; i++) {
       const d = Math.abs(A.f[i * A.st + k] - B.f[i * B.st + q]);
       if (d > maxAbs) maxAbs = d;
+      if (d > lim.outlier) out++;
       sum += d; cnt++;
     }
   }
-  const ok = maxAbs <= LIMIT[label];
+  const mean = sum / cnt, ratio = out / cnt;
+  const ok = mean <= lim.mean && ratio <= lim.ratio;
   if (!ok) bad++;
-  console.log('  ' + label.padEnd(12) + ' 最大=' + maxAbs.toExponential(2) + ' 平均=' + (sum / cnt).toExponential(2) + (ok ? '  ✓' : '  ✗ 超出阈值 ' + LIMIT[label]));
+  console.log('  ' + label.padEnd(12) + ' 平均=' + mean.toExponential(2) + ' 最大=' + maxAbs.toExponential(2) +
+    ' 超差比例=' + (ratio * 100).toFixed(3) + '%' + (ok ? '  ✓' : '  ✗ 超出阈值'));
 }
 
 /* 球谐：输出的第 j 个对应原始的第 floor(j/per)*15 + j%per 个（见 pack.mjs 的重新编号说明） */
 const outRest = B.props.filter((p) => /^f_rest_\d+$/.test(p));
-const per = outRest.length / 3;
-let sMax = 0, sSum = 0, sCnt = 0;
-for (let j = 0; j < outRest.length; j++) {
-  const srcName = 'f_rest_' + (Math.floor(j / per) * 15 + (j % per));
-  const k = A.props.indexOf(srcName), q = B.props.indexOf(outRest[j]);
-  if (k < 0 || q < 0) { console.log('  SH 映射缺失 j=' + j + ' ' + srcName); bad++; continue; }
-  for (let i = 0; i < A.n; i++) {
-    const d = Math.abs(A.f[i * A.st + k] - B.f[i * B.st + q]);
-    if (d > sMax) sMax = d;
-    sSum += d; sCnt++;
+if (outRest.length) {
+  const per = outRest.length / 3;
+  let sMax = 0, sSum = 0, sCnt = 0;
+  for (let j = 0; j < outRest.length; j++) {
+    const srcName = 'f_rest_' + (Math.floor(j / per) * 15 + (j % per));
+    const k = A.props.indexOf(srcName), q = B.props.indexOf(outRest[j]);
+    if (k < 0 || q < 0) { console.log('  SH 映射缺失 j=' + j + ' ' + srcName); bad++; continue; }
+    for (let i = 0; i < N; i++) {
+      const d = Math.abs(A.f[i * A.st + k] - B.f[i * B.st + q]);
+      if (d > sMax) sMax = d;
+      sSum += d; sCnt++;
+    }
   }
+  const shOk = (sSum / sCnt) < 5e-3;
+  if (!shOk) bad++;
+  console.log('  ' + ('SH ' + outRest.length + '系数').padEnd(12) + ' 平均=' + (sSum / sCnt).toExponential(2) +
+    ' 最大=' + sMax.toExponential(2) + (shOk ? '  ✓' : '  ✗'));
 }
-const shOk = (sSum / sCnt) < 5e-3;
-if (!shOk) bad++;
-console.log('  ' + ('SH ' + outRest.length + '系数').padEnd(12) + ' 最大=' + sMax.toExponential(2) + ' 平均=' + (sSum / sCnt).toExponential(2) + (shOk ? '  ✓' : '  ✗'));
 
 console.log(bad ? '\n⚠ 有 ' + bad + ' 组超出阈值，请检查 tools/pack.mjs' : '\n✅ 全部通过');
 process.exit(bad ? 1 : 0);

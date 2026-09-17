@@ -7,7 +7,8 @@
  *
  * 选项：
  *   --name <名称>     展示用名称（默认继承上次的值，新条目取文件名里的时间戳）
- *   --sh <0|1|2|3>    完整档的球谐阶数，默认 2（见下方体积对照）
+ *   --sh <0|1|2|3>    球谐阶数，默认 2（见下方体积对照）
+ *   --profile <档位>  full（默认，位置 24bit/尺度 16bit）或 compact（位置 16bit/尺度 8bit，更小）
  *   --id <标识>       model.json 里的 id，默认 model-1
  *   --file <文件名>   完整档输出文件名，默认 <id>.bin
  *   --lite-ratio <r>  预览档保留比例，默认 0.35
@@ -55,6 +56,7 @@ const opt = (key, def) => {
 const hasFlag = (key) => argv.includes('--' + key);
 const given = (key) => argv.includes('--' + key);
 const degree = parseInt(opt('sh', '2'), 10);
+const profile = opt('profile', 'full');   // full | compact
 const projDir = path.resolve(opt('proj', path.join(HERE, '..')));
 const assetsDir = path.join(projDir, 'assets');
 const baseName = path.basename(src);
@@ -74,7 +76,7 @@ console.log('原始大小: ' + (raw.length / 1048576).toFixed(2) + ' MB');
 
 const MB1 = (n) => (n / 1048576).toFixed(2) + ' MB';
 const t0 = Date.now();
-const full = buildPayload(raw, { degree, profile: 'full' });
+const full = buildPayload(raw, { degree, profile });
 const fullDef = zlib.deflateSync(full.payload, { level: 9, memLevel: 9 });
 console.log('完整档: ' + full.count.toLocaleString('en-US') + ' 点 × ' + full.REC + ' B/点（SH' + full.degree +
   '，' + full.restCount + ' 系数）载荷 ' + MB1(full.payload.length) + ' → deflate ' + MB1(fullDef.length));
@@ -130,7 +132,9 @@ if (prev && !hasFlag('keep')) console.log('检测到已有条目 id=' + id + '�
 
 const entry = {
   id,
-  name: given('name') || (prev && prev.name) || name,
+  /* 注意：这里必须用 opt() 取「值」，不能写成 given()（那是返回布尔值的判断），
+     否则命令行传了 --name 之后写进清单的就变成 true 了。 */
+  name: opt('name', '') || (prev && prev.name) || name,
   file: path.relative(projDir, binPath).split(path.sep).join('/'),
   count: full.count,
   shDegree: full.degree,
@@ -166,3 +170,4 @@ console.log('写出: ' + path.relative(projDir, binPath) + '  (' + MB1(fullDef.l
 if (litePath) console.log('写出: ' + path.relative(projDir, litePath) + '  (' + MB1(liteDef.length) + ')');
 console.log('写出: ' + path.relative(projDir, jsonPath));
 console.log('完成。本地预览: node tools/serve.mjs  或  python -m http.server');
+

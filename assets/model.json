@@ -41,6 +41,53 @@
       "source": "VID_20260914_174313.ply",
       "generatedAt": "2026-09-15 05:51:10",
       "generator": "tools/build.mjs (full SH2/47B, lite 17B×35%, deflate)"
+    },
+    {
+      "id": "model-2",
+      "name": "1号宿舍楼局部",
+      "file": "assets/model-2.bin",
+      "count": 861432,
+      "shDegree": 1,
+      "fileLite": null,
+      "liteCount": null,
+      "liteBytes": null,
+      "bytes": 21690074,
+      "flipX": false,
+      "yaw": -1.8359,
+      "pitch": 1.6214,
+      "frame": {
+        "center": [
+          5.39,
+          0.066,
+          5.333
+        ],
+        "size": [
+          13.174,
+          8.51,
+          15.402
+        ]
+      },
+      "rawBounds": {
+        "min": [
+          -1.197,
+          -4.189,
+          -2.368
+        ],
+        "max": [
+          11.977,
+          4.321,
+          13.034
+        ]
+      },
+      "source": "VID_20260917_180455.ply",
+      "generatedAt": "2026-09-17 10:34:36",
+      "generator": "tools/build.mjs (full SH1/26B, lite off, deflate)",
+      "orient": [
+        -0.864271,
+        0,
+        -0.481965,
+        0.144033
+      ]
     }
   ]
 }
